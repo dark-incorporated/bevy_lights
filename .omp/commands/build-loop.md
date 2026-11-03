@@ -305,13 +305,15 @@ proud of.
   justified trade. Compare only on the same machine and the same load; the bench is CPU-only, so it
   says nothing about GPU cost — for a shader change, compare the capture's frame time in the log.
 - Run the full gate (the `AGENTS.md` set):
-  1. `cargo build --release && cargo build && cargo test && cargo test --features serde`
+  1. `cargo build --release && cargo build && cargo nextest run && cargo nextest run --features serde`
   2. `cargo build --examples --all-features`
   3. `cargo clippy --all-targets --all-features -- -D warnings`
   4. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`
   5. `cargo fmt --check`
   6. `cargo build --lib --target wasm32-unknown-unknown`
   7. `cargo run --release --manifest-path tools/wesl-check/Cargo.toml -- src`
+
+Fast testing across the home cloud — the host matrix, mold, sccache and the measured numbers — is `agents/TESTING.md` in the codex_fs depot: `/mnt/codex_fs/agents/TESTING.md`, or `ssh three cat /mnt/codex_fs/agents/TESTING.md` from a host that does not mount it.
 
 ## 8. Ship
 
