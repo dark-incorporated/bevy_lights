@@ -53,8 +53,10 @@ Pinned to **Bevy 0.20.0**. Read the vendored source (`~/.cargo/registry/src/inde
 cargo build --release
 cargo build
 cargo build --features serde
-cargo test
-cargo test --features serde
+cargo nextest run
+cargo test --doc
+cargo nextest run --features serde
+cargo test --features serde --doc
 cargo build --examples --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
@@ -67,8 +69,9 @@ Use `CARGO_TARGET_DIR=$HOME/bevy_lights/target` on mac_air: the shared
 `~/.cargo-target-shared/global` is 85 GB and the boot volume has crossed 98 % full, at which point
 builds fail with `No space left on device` in the middle of a link and read as a code error.
 
-`cargo build` (bare) comes before `cargo test` deliberately: `cargo test` compiles the full `bevy`
-dev-dependency, and Cargo unifies features across a build, so under `cargo test` the crate silently
+`cargo build` (bare) comes before the test run deliberately: **any** test runner (`cargo nextest run` as
+much as `cargo test`) compiles the full `bevy` dev-dependency, and Cargo unifies features across a build,
+so under a test run the crate silently
 receives every Bevy feature and a hole in its own trimmed feature list cannot fail. A plain
 `cargo build` compiles what a consumer actually gets.
 
@@ -206,5 +209,6 @@ is an art decision, so it needs the same treatment as a physics constant.
 - **`MeshTag::new` is the only constructor** (`type_id` is a private debug-only field), and a
   billboarded quad needs `NoFrustumCulling`: the CPU `Aabb` of the unit square does not cover what the
   vertex stage draws.
-- **`cargo test` hides holes in a trimmed feature list**, because the full-`bevy` dev-dependency
-  unifies features into the library graph. `cargo build` alone compiles a consumer's view.
+- **A test run hides holes in a trimmed feature list** — `cargo nextest run` as much as `cargo test` —
+  because the full-`bevy` dev-dependency unifies features into the library graph. `cargo build` alone
+  compiles a consumer's view.

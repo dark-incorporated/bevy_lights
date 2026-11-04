@@ -41,9 +41,9 @@ jobs:
 
       # **The load-bearing step, and it is `build` rather than `test` deliberately.**
       #
-      # `cargo test` compiles dev-dependencies, and this crate's dev-dependency is the FULL `bevy`
+      # A test run compiles dev-dependencies, and this crate's dev-dependency is the FULL `bevy`
       # umbrella — the examples need a window and a camera, while the crate itself is trimmed to the
-      # features it names. Cargo unifies features across a build, so under `cargo test` the crate
+      # features it names. Cargo unifies features across a build, so under `cargo nextest run` the crate
       # silently receives every Bevy feature there is, and a hole in its own `[dependencies]` feature
       # list cannot fail.
       #
@@ -57,11 +57,16 @@ jobs:
         run: cargo build --features serde
 
       # Includes `tests/leaf.rs`, the boundary ratchet, and the model's own unit tests.
+      - uses: taiki-e/install-action@nextest
       - name: Test
-        run: cargo test
+        run: cargo nextest run --no-fail-fast
 
       - name: Test with the serde feature
-        run: cargo test --features serde
+        run: cargo nextest run --features serde --no-fail-fast
+
+      # nextest does not run doctests: 35 of them, in both feature sets.
+      - name: Doctests
+        run: cargo test --doc && cargo test --features serde --doc
 
       # Debug-info debugprofile links of a Bevy example ran a sibling crate's runner out of memory:
       # `ld terminated with signal 7 [Bus error]`. Examples only have to load; debuginfo is turned off

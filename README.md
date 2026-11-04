@@ -11,7 +11,7 @@ lights placed over thousands of virtual ones, and billboard shader flames.
 > researched and every default is cited or marked a design default; the code is tested, gated in CI
 > and reviewed against captures. It is still code an agent wrote, and you should treat it as such.
 
-![Four braziers, each with a real light of its own, and 48 torch-bearers sharing an 8-light pool](docs/media/showcase.gif)
+![Four braziers, each with a real light of its own, and 48 torch-bearers sharing an 8-light pool](https://raw.githubusercontent.com/bevy-coven/bevy_lights/main/docs/media/showcase.gif)
 
 *Two seconds of `examples/courtyard`, 400 × 225 at 30 fps: four braziers — real lights, each with a
 `Kindle` and a 0.34 m coal bed, which the puffing law sizes to `1.5/√0.34 ≈ 2.57 Hz` — and 48
@@ -20,10 +20,10 @@ while the courtyard is still lighting up and the fires breathe from there; the c
 `char_field` texture the example builds at startup. The opening cannot show a **flame** catching: a
 flame's catch runs on `Time<Real>`, and on a headless capture the material's first pipeline compile
 outlasts `KINDLE_SECONDS`. A *re*-light does not have that problem, so the catch is the next clip.
-[`docs/DEMOS.md`](docs/DEMOS.md) has that trap and the frequencies measured in this file. The same
-courtyard at 640 × 360 is [`courtyard.gif`](docs/media/courtyard.gif).
+[`docs/DEMOS.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/DEMOS.md) has that trap and the frequencies measured in this file. The same
+courtyard at 640 × 360 is [`courtyard.gif`](https://raw.githubusercontent.com/bevy-coven/bevy_lights/main/docs/media/courtyard.gif).
 
-![The courtyard's fires put out and lit again: the light and the flame fall away together, then catch together](docs/media/relight.gif)
+![The courtyard's fires put out and lit again: the light and the flame fall away together, then catch together](https://raw.githubusercontent.com/bevy-coven/bevy_lights/main/docs/media/relight.gif)
 
 *`LIGHTS_SNUFF=1.0 LIGHTS_RELIGHT=2.3` on the same courtyard, 400 × 225 at 30 fps, 64 frames (about 2.1 s): every
 brazier and torch is snuffed (`Snuff`, 1.2 s) so the stone falls to the cool moonlight with only the coals glowing,
@@ -337,16 +337,16 @@ Every default is researched and cited, or marked a design default. The notes:
 
 | note | what it settles | key sources |
 |---|---|---|
-| [`docs/research/fire-light.md`](docs/research/fire-light.md) | the flicker's rate and amplitude, the kindle's flare | Sanctuary decisions 0127/0148; Team Fortress 2's illustrative ramp (SIGGRAPH 2007 *Advances*); the fire-physics literature this crate is still missing |
-| [`docs/research/light-pool.md`](docs/research/light-pool.md) | the pool's budget, reach, sort and phases | Olsson, Billeter & Assarsson 2012 (clustered shading); Ghost of Tsushima (SIGGRAPH 2021 *Advances*); *Stochastic tile-based lighting* (SIGGRAPH 2025 *Advances*); RTR4's many-light chapter |
-| [`docs/research/flame.md`](docs/research/flame.md) | the flame's shape, noise, ramp and packing | Nguyen, *GPU Gems* ch. 6 §6.1; RTR4 §6.3; Sanctuary decision 0228 |
-| [`docs/research/flame-flicker.md`](docs/research/flame-flicker.md) | why a drawn flame breathes with the light it motivates, and how the two share one function | Xia & Zhang 2018; SIGGRAPH 2011 *Advances*' fire talk; Doğaner on motivated sources |
-| [`docs/research/flicker-depth.md`](docs/research/flicker-depth.md) | how far a fire dips, who chooses, and a measured ceiling for the default | Mandin & Most (IAFSS 6) on flame fluctuation; Gergely et al. 2020; Doğaner |
-| [`docs/research/fuel-bed.md`](docs/research/fuel-bed.md) | why a bed is a temperature field and not a constant `emissive` | Pirk et al. 2017 (wood combustion); Xia & Zhang 2018; *PBR* 3rd ed. ch. 12 on blackbody emitters; Prince 2004 on clipped highlights |
-| [`docs/research/corpus.md`](docs/research/corpus.md) | what the home-still library holds for cinematography, photography, CG lighting, game-lighting craft, many-light rendering, fire physics and perception — and what it does not | the live corpus |
+| [`docs/research/fire-light.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/research/fire-light.md) | the flicker's rate and amplitude, the kindle's flare | Sanctuary decisions 0127/0148; Team Fortress 2's illustrative ramp (SIGGRAPH 2007 *Advances*); the fire-physics literature this crate is still missing |
+| [`docs/research/light-pool.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/research/light-pool.md) | the pool's budget, reach, sort and phases | Olsson, Billeter & Assarsson 2012 (clustered shading); Ghost of Tsushima (SIGGRAPH 2021 *Advances*); *Stochastic tile-based lighting* (SIGGRAPH 2025 *Advances*); RTR4's many-light chapter |
+| [`docs/research/flame.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/research/flame.md) | the flame's shape, noise, ramp and packing | Nguyen, *GPU Gems* ch. 6 §6.1; RTR4 §6.3; Sanctuary decision 0228 |
+| [`docs/research/flame-flicker.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/research/flame-flicker.md) | why a drawn flame breathes with the light it motivates, and how the two share one function | Xia & Zhang 2018; SIGGRAPH 2011 *Advances*' fire talk; Doğaner on motivated sources |
+| [`docs/research/flicker-depth.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/research/flicker-depth.md) | how far a fire dips, who chooses, and a measured ceiling for the default | Mandin & Most (IAFSS 6) on flame fluctuation; Gergely et al. 2020; Doğaner |
+| [`docs/research/fuel-bed.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/research/fuel-bed.md) | why a bed is a temperature field and not a constant `emissive` | Pirk et al. 2017 (wood combustion); Xia & Zhang 2018; *PBR* 3rd ed. ch. 12 on blackbody emitters; Prince 2004 on clipped highlights |
+| [`docs/research/corpus.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/research/corpus.md) | what the home-still library holds for cinematography, photography, CG lighting, game-lighting craft, many-light rendering, fire physics and perception — and what it does not | the live corpus |
 
 The full index, with the notes behind the flame's silhouette, its catch and its read from overhead, is
-[`docs/research/README.md`](docs/research/README.md).
+[`docs/research/README.md`](https://github.com/bevy-coven/bevy_lights/blob/main/docs/research/README.md).
 
 ## Bevy compatibility
 
