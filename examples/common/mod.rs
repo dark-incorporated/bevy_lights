@@ -17,6 +17,8 @@
 //!   the flames; unset is still air.
 //! - `LIGHTS_GUST=I` makes that wind gust with turbulence intensity `I` (0.25 is a lively courtyard);
 //!   `LIGHTS_WIND` is then the mean, and `LIGHTS_SEED` picks the wind.
+//! - `LIGHTS_MOTION=g` (courtyard): how much of a fire's own velocity counts as wind (`FlameMotion::gain`); `0` is every flame upright
+//!   however it is carried.
 //! - `LIGHTS_KIND=<name>` (courtyard): the braziers burn as that `FireKind`.
 //! - `LIGHTS_EMBERS=r` (courtyard): every flame sheds `r` sparks a second (`FlameEmbers`); unset, none.
 //!
@@ -48,6 +50,11 @@ pub fn wind_env() -> Option<Vec2> {
     let v: Vec<f32> =
         std::env::var("LIGHTS_WIND").ok()?.split(',').filter_map(|p| p.trim().parse().ok()).collect();
     (v.len() == 2).then(|| Vec2::new(v[0], v[1]))
+}
+
+/// The motion gain from `LIGHTS_MOTION=g`; `None` is the crate's default (a fire feels its own velocity in full).
+pub fn motion_env() -> Option<f32> {
+    std::env::var("LIGHTS_MOTION").ok()?.trim().parse().ok()
 }
 
 /// The turbulence intensity from `LIGHTS_GUST=I`; `None` is a steady wind.
@@ -284,6 +291,65 @@ fn run_limit(
         Some(_) if *waited < 120 => *waited += 1,
         _ => {
             exit.write(AppExit::Success);
+        }
+    }
+}
+
+/// `LIGHTS_GPU_TIMING=1` records the render graph's GPU timestamps and prints, once, the mean per pass
+/// (microseconds, frames 100 to 400) on stdout as `gpu_us <pass> <mean>`. It needs a Vulkan or DX12
+/// adapter with timestamp queries; without one the run prints nothing. Run it with `LIGHTS_FRAMES=420`.
+pub fn gpu_timing_on() -> bool {
+    std::env::var("LIGHTS_GPU_TIMING").is_ok_and(|v| v != "0")
+}
+
+/// The render plugin, asking the adapter for timestamp queries when `LIGHTS_GPU_TIMING` is on: pass it to `DefaultPlugins.set(..)`.
+pub fn render_plugin() -> bevy::render::RenderPlugin {
+    bevy::render::RenderPlugin {
+        render_creation: bevy::render::settings::WgpuSettings {
+            features: if gpu_timing_on() {
+                bevy::render::settings::WgpuFeatures::TIMESTAMP_QUERY
+                    | bevy::render::settings::WgpuFeatures::TIMESTAMP_QUERY_INSIDE_PASSES
+                    | bevy::render::settings::WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS
+            } else {
+                bevy::render::settings::WgpuFeatures::empty()
+            },
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
+    }
+}
+
+fn report_gpu(
+    store: Res<bevy::diagnostic::DiagnosticsStore>,
+    mut sums: Local<std::collections::BTreeMap<String, (f64, u32)>>,
+    mut frame: Local<u32>,
+) {
+    *frame += 1;
+    if (100..400).contains(&*frame) {
+        for d in store.iter().filter(|d| d.path().as_str().ends_with("elapsed_gpu")) {
+            if let Some(ms) = d.value() {
+                let entry = sums.entry(d.path().to_string()).or_default();
+                entry.0 += ms;
+                entry.1 += 1;
+            }
+        }
+    }
+    if *frame == 400 {
+        for (path, (sum, n)) in sums.iter() {
+            println!("gpu_us {path} {:.1}", sum / f64::from((*n).max(1)) * 1000.0);
+        }
+    }
+}
+
+/// Adds the render diagnostics and the report when `LIGHTS_GPU_TIMING` asks for them.
+pub struct GpuTiming;
+
+impl Plugin for GpuTiming {
+    fn build(&self, app: &mut App) {
+        if gpu_timing_on() {
+            app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
+                .add_systems(Update, report_gpu);
         }
     }
 }

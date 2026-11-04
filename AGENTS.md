@@ -1,9 +1,11 @@
 # bevy_lights — notes for agents
 
+README and docs follow https://github.com/bevy-coven/.github/blob/main/DOCUMENTATION.md; a feature is not done until its README line and, if visible, its GIF exist.
+
 A Bevy 0.20 library for the **practical lights** a scene's props actually carry: fires that flicker
 and flare as they kindle, a budgeted pool of real lights handed to the nearest props over thousands
-of virtual ones, and billboarded shader flames. Small on purpose: three plugins, three public
-components' worth of state, an engine-free `src/model/` and one shader.
+of virtual ones, and billboarded shader flames. Small on purpose: three plugins (and a fourth, `FirePlugin`, that writes
+what they run from one component), three public components' worth of state, an engine-free `src/model/` and one shader.
 
 ## Force pushes and deletions need the user's express permission
 
@@ -17,7 +19,7 @@ When one of these seems necessary, stop and ask. Name the exact command, what it
 
 ## Source of truth
 
-This repository, [`Ladvien/bevy_lights`](https://github.com/Ladvien/bevy_lights), is canonical. MIT OR Apache-2.0. Sanctuary (`/Users/ladvien/sanctuary`) consumes it **by crates.io version**. A fix or a feature lands here first, in its own commit with tests, and is never patched into the game. The ladvien dependencies are crates.io versions, and the family moves together.
+This repository, [`bevy-coven/bevy_lights`](https://github.com/bevy-coven/bevy_lights), is canonical. MIT OR Apache-2.0. Sanctuary (`/Users/ladvien/sanctuary`) consumes it **by crates.io version**. A fix or a feature lands here first, in its own commit with tests, and is never patched into the game. The ladvien dependencies are crates.io versions, and the family moves together.
 
 ## Version pin
 
@@ -27,19 +29,29 @@ Pinned to **Bevy 0.20.0**. Read the vendored source (`~/.cargo/registry/src/inde
 
 - `src/lib.rs` — the crate docs, the flat re-exports (no prelude), and `LightsSystems`.
 - `src/model/mod.rs` — the engine-free half.
-- `src/model/fire.rs` — `flicker_factor`, `kindle_gain`, `KINDLE_SECONDS`.
+- `src/model/fire.rs` — `flicker_factor`, `kindle_gain`, `KINDLE_SECONDS`, `fire_phase` (a fire's own start on its clock, from an entity's bits).
 - `src/model/reach.rs` — `raised_light`, `RANGE_MARGIN`.
 - `src/model/tag.rs` — `pack_flame_tag`, `unpack_flame_tag`.
+- `src/model/fire_colour.rs` — `retint`, `flame_mid` and the shipped ramp's stops: a fire's own colour, as the orange ramp moved to its hue (`docs/research/fire-colour.md`), and a flame's middle from its light's colour.
+- `src/model/tongue.rs` — `flame_tongue`, `Tongue`, `MAX_TONGUES`, `MERGE_RATIO`, `INWARD_LEAN`: where a wide fire's tongues stand, how tall each is and how it leans (`docs/research/flame-tongues.md`).
+- `src/model/bed.rs` — `bed_radiance`, `bed_ramp`, `bed_heat_step`, `bed_drawn_heat`, `bed_offset`, `pack_bed_tag`, `BED_*`: a fuel bed's heat, its colour at a heat and its packing (`docs/research/fuel-bed-heat.md`); `src/model/char.rs` also has `char_tile`, the tileable field, and `src/model/cinematography.rs` `blackbody_radiance`, the blackbody below the 1000 K floor.
 - `src/flicker.rs` — `FlickerPlugin`, `Flicker`, `Kindle`, `Kindled`, and `flicker_lights` over both light types.
-- `src/pool.rs` — `LightPoolPlugin<F>`, `LightPool`, `PoolCandidate`, `PoolLight`, `assign_pool::<F>`.
+- `src/fire.rs` — `FirePlugin`, `Fire`, `expand_fires`, `FIRE_EDGE_LUX`: a whole fire as one serde/Reflect component that writes the `FlameSite`, `PoolCandidate` and the kind's `FlameEmbers`, `FlameSmoke`, `FlameTongues` and `FuelBed` (`docs/research/fire-component.md`). A `Fire` that has just arrived writes each part with `insert_if_new` (what the host spawned beside it wins); a changed one writes them all and removes what it no longer names.
+- `src/pool.rs` — `LightPoolPlugin<F>`, `LightPool`, `FocusRule`, `PoolCandidate`, `PoolLight`, `assign_pool::<F>`. `src/model/pool.rs` holds the hand-off rule and the shared pool's maths (`focus_quota`, `quota_cutoff`, `shared_value`).
 - `src/flame.rs` — `FlamePlugin`, `FlameMaterial`, `FlameLook`, `FlameSite`, `Flame`, `dress_flames`, `update_flames`.
+- `src/motion.rs` — `FlameMotion` (a resource: the gain and the response of a fire's own motion as wind), `FlameVelocity` (a component `FlameSite` requires: its smoothed ground velocity) and `track_flame_velocity`, which differences the site's `GlobalTransform` ahead of the pool (`docs/research/flame-motion.md`). `src/model/motion.rs` has the maths (`smooth_velocity`, `relative_air`).
 - `src/flame.wesl` — the flame shader, embedded with `embedded_asset!`.
 - `src/embers.rs`, `src/embers.wesl` — `FlameEmbers` and the spark quad (a child of the `Flame`, registered by `FlamePlugin`).
+- `src/smoke.rs`, `src/smoke.wesl` — `FlameSmoke` and the smoke quad (a child of the `Flame`, the spark quad's geometry and culling box, additive only), and the trail that quad becomes when its fire is put out (`SmokeTail`, `begin_smoke_tails`, `update_smoke_tails`; `docs/research/flame-smoke-tail.md`).
+- `src/tongues.rs` — `FlameTongues` and `FlameTongue` and `dress_tongues`: a wide fire (a campfire, a bonfire) as extra `Flame` children of its site, one per tongue.
+- `src/bed.rs`, `src/bed.wesl` — `FuelBed` and the coal disc (a child of the `FlameSite`, one shared material, the heat in its `MeshTag`), `update_beds`.
 - `examples/common/mod.rs` — the `LIGHTS_*` run switches and the fly camera.
 - `examples/courtyard.rs` — the showcase and capture scene: four braziers, 48 torch-bearers, an orbit focus.
 - `examples/bench_lights.rs` — the CPU bench, no window and no GPU.
+- `examples/campfire.rs` — a campfire and a bonfire as `FireKind`s with their tongues and beds (`LIGHTS_TONGUES=0` is the one-flame comparison, `LIGHTS_BED=0` the one without coals).
+- `examples/bench_flames.rs` — what thousands of flames cost when few are on screen: headless, off-screen, needs a GPU adapter.
 - `tests/leaf.rs` — the boundary ratchet: the dependency list, forbidden names, engine-free `src/model/`.
-- `tests/flicker.rs`, `tests/pool.rs` — the two plugins' consumer-visible behaviour.
+- `tests/flicker.rs`, `tests/pool.rs`, `tests/fire.rs` — the plugins' consumer-visible behaviour.
 - `tools/wesl-check/` — compiles `src/flame.wesl` to WGSL and parses it with naga, without a GPU.
 - `docs/research/*.md` — one note per system, plus `corpus.md`.
 - `docs/loop-log.md` — what each improvement-loop iteration did.
@@ -53,10 +65,8 @@ Pinned to **Bevy 0.20.0**. Read the vendored source (`~/.cargo/registry/src/inde
 cargo build --release
 cargo build
 cargo build --features serde
-cargo nextest run
-cargo test --doc
-cargo nextest run --features serde
-cargo test --features serde --doc
+cargo test
+cargo test --features serde
 cargo build --examples --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
@@ -69,9 +79,8 @@ Use `CARGO_TARGET_DIR=$HOME/bevy_lights/target` on mac_air: the shared
 `~/.cargo-target-shared/global` is 85 GB and the boot volume has crossed 98 % full, at which point
 builds fail with `No space left on device` in the middle of a link and read as a code error.
 
-`cargo build` (bare) comes before the test run deliberately: **any** test runner (`cargo nextest run` as
-much as `cargo test`) compiles the full `bevy` dev-dependency, and Cargo unifies features across a build,
-so under a test run the crate silently
+`cargo build` (bare) comes before `cargo test` deliberately: `cargo test` compiles the full `bevy`
+dev-dependency, and Cargo unifies features across a build, so under `cargo test` the crate silently
 receives every Bevy feature and a hole in its own trimmed feature list cannot fail. A plain
 `cargo build` compiles what a consumer actually gets.
 
@@ -110,7 +119,7 @@ is an art decision, so it needs the same treatment as a physics constant.
    (`elements`, `flora`, `society`) that reads the sibling's public resources. It never makes a
    sibling depend on this crate.
 4. **A needed sibling change** lands in the sibling's repo as an issue or PR. For `bevy_elements` that
-   is always an issue (`gh issue create -R Ladvien/bevy_elements`), never a patch.
+   is always an issue (`gh issue create -R bevy-coven/bevy_elements`), never a patch.
 5. **Units.** Intensities are Bevy's: lumens for a point or spot light. Distances are the host's world
    units, and this crate converts nothing. Interop with `bevy_elements`' SI-metre
    `light_intensity`/`display_value` goes through `bevy_elements::ElementsUnits`, in the host.
@@ -141,8 +150,9 @@ is an art decision, so it needs the same treatment as a physics constant.
 - **All run conditions are evaluated — there is no short-circuit.** A bare `Res<T>` in a
   `.run_if(..)` closure panics whenever that resource is absent.
 - **`Single<..>` silently skips its system on a non-unique match.** The pool's focus is a plain
-  `Query` and counts its matches instead, because two foci is a *reportable* state and `Single` would
-  hide it.
+  `Query` and counts its matches instead, because two foci is a *reportable* state under the default
+  `FocusRule::One` and `Single` would hide it. `FocusRule::Shared` takes any number, one per viewer, and
+  shares `LightPool::size` between them (`docs/research/pool-foci.md`): `size` is the total, never per view.
 - **Lifecycle observers take the event:** `On<Add<A>>`, `On<Remove<A>>`.
 - Do not hard-wrap markdown.
 - Close any Bevy app you launch.
@@ -201,14 +211,42 @@ is an art decision, so it needs the same treatment as a physics constant.
   recomputed in `PostUpdate`, after `Update`, and the light is extracted that same frame), so a light
   switched on by `Visibility` is written anyway: `is_hidden` exempts a `Visibility` changed (not added)
   this frame. Skipping it drew a pool reserve's first frame at the tail of its last fade, 112 lm for
-  70 000.
+  70 000. **A light the *camera* turns to is the same trap** (no `Visibility` changes, only the view
+  does): `write_lights_coming_into_view` runs in `PostUpdate` after `CheckVisibility` and
+  `MarkNewlyHiddenEntitiesInvisible` and writes every light whose `ViewVisibility` is `Changed` and now
+  true. A static test camera never shows it; a moving one drew a pool light at 75 903 lm for one frame
+  where the fade-in was at 104.
+- **A flame's colour is one material per colour, held by ids.** `FlameSite::color` makes `FlameAssets` (and `EmberAssets`) a map from the colour's bits to an `AssetId`, never a `Handle`: the flames hold the material, the asset is dropped with the last of them, and `sweep` forgets the id, so a colour a host changes every frame is one live material and not one per colour ever shown (`a_colour_changed_every_frame_holds_a_bounded_number_of_materials`). A `Handle` in the map would leak every one.
+- **A ramp transform that is the identity only at the shipped colour changes every scene that sets its own.** `retint` first rotated the whole ramp by the difference of hues, and the courtyard's `FlameLook::color` (a 1900 K blackbody, 16° redder than `DEFAULT_MID`) pushed the rim past red into pink on every torch: 3 514 pixels differed from the old build. The zero-pixel capture diff of the *default* courtyard against the old build is what found it, so run it for any change to what a flame's colours are made of. The fire family (red to yellow) is the identity; the rotation fades in beyond it.
+- **A moving fire's lean is one number read in two places, and a spawned site's first `GlobalTransform` is the identity.** `update_flames` (the flame's lean) and the pool's `lean_of` (the light's shift) both take the *relative air* `wind - gain * FlameVelocity::ground` (`relative_air`): change one and the light stands outside the flame it motivates, which `a_pooled_light_follows_the_lean_of_a_carried_flame` pins. `track_flame_velocity` runs in `Update` ahead of `LightsSystems::Pool` and reads last frame's propagated `GlobalTransform`; a site spawned that frame has the identity there, so the step into its real place is a spawn and not a motion (a site spawned 0.4 m from the origin passes for a 24 m/s walk): the first two frames only seed `last`. The skip for a fire that has not moved compares positions, not change ticks, because a system that returns early on a paused frame still advances its `last_run` and would lose a move made meanwhile. `FlameVelocity`'s fields are private (build one with `default()` and set `ground`).
 - **A duplicated plugin panics.** `LightPoolPlugin` therefore cannot add `FlickerPlugin` for the host;
   it reports the missing one in `finish()`.
 - **A parent of a visible entity needs the visibility components.** A `FlameSite` gained `#[require(Visibility, InheritedVisibility, ViewVisibility)]` because `dress_flames` spawns a `Flame` under it: without them Bevy warns (B0004) and the child's visibility is not inherited, so a torch's flame does not go out with the torch.
 - **Replacing a component leaves its `added` tick alone.** `entity.insert(Kindle::default())` over an existing `Kindle` updates only the *changed* tick (`Column::replace`), so `Added<Kindle>` never reports a re-lit fire. `Kindled` is announced from `elapsed == 0.0` instead, and `modulate` floors the advance at `f32::MIN_POSITIVE` so a zero-delta frame (the first of a fixed-step run) cannot announce the same fire twice.
-- **`MeshTag::new` is the only constructor** (`type_id` is a private debug-only field), and a
-  billboarded quad needs `NoFrustumCulling`: the CPU `Aabb` of the unit square does not cover what the
-  vertex stage draws.
+- **`MeshTag::new` is the only constructor** (`type_id` is a private debug-only field).
 - **A test run hides holes in a trimmed feature list** — `cargo nextest run` as much as `cargo test` —
   because the full-`bevy` dev-dependency unifies features into the library graph. `cargo build` alone
   compiles a consumer's view.
+- **A billboarded quad's box is the crate's, not the engine's.** The CPU `Aabb` of the unit square does not cover what the
+  vertex stage draws, and `NoFrustumCulling` (the old answer) draws and re-extracts every flame in the world every frame:
+  1.3 µs a flame, 6.5 ms at 5 000 torches with none in view. A `Flame` carries its own `Aabb` and `NoAutoAabb`: a cube about
+  the foot of side `2 · FLAME_REACH · size`, **divided by the instance scale** (`flame_cull_extents`), because the catch and
+  the wind's lean are the scale's `x`, `y` and `z` and the engine multiplies a box by its entity's scale. A scale that is data
+  distorts any box built once; `set_scale` rewrites the box on exactly the frames it rewrites the scale. The test
+  `a_flame_any_part_of_which_is_on_screen_is_never_culled` carries a port of the vertex stage's corner formula: change that
+  geometry in `src/flame.wesl` and the port and `FLAME_REACH` must change with it, or flames pop at the screen's edge.
+  The ember quad (`FlameEmbers`) is the same trap with a wider reach that grows with the lean: `ember_cull_extents`
+  (`ember_reach`: `sqrt((0.7 + 3.9 · |lean|)² + 2.95²)` flame heights), rewritten by `update_embers` on the frame the flame's
+  scale is, *after* `update_flames`. Change `HALF_WIDTH`, `RISE_MAX`, `MARGIN` or `DRIFT` in `src/embers.wesl` and the port in
+  `an_ember_quad_any_part_of_which_is_on_screen_is_never_culled` and `model/tag.rs`'s mirrors must change with them.
+  The smoke quad (`FlameSmoke`) is the ember quad's geometry constant for constant and uses `ember_cull_extents`: change `HALF_WIDTH`,
+  `RISE_MAX`, `MARGIN` or `LEAN_TOP` in `src/smoke.wesl` and its own port (`a_smoke_quad_any_part_of_which_is_on_screen_is_never_culled`)
+  and the ember mirrors change together, or the smoke of a fire at the screen's edge pops. A smoke column is **additive only**: a blended
+  smoke sorts against every other transparent surface of the host (`docs/research/flame-smoke.md`), and a column drawn thinner than a pixel
+  crawls, so `smoke.wesl` floors its width at a pixel and a quarter and fades its noise out when it cannot be resolved.
+- **A smoke trail rides two data channels, and a bit stolen from a field must be cleared on the normal path.** A put-out fire's smoke (`docs/research/flame-smoke-tail.md`) is the same quad in another mode: the quad's world scale `x` is `1 / (1 + seconds since the douse)` (the flame's own `x` is `0.001` by then, so `update_smoke_tails` sets the quad's *local* scale to `x / flame.x`; a world scale is the flame's times the quad's, and the culling box is divided by the world product, `tail_cull_box`), and the lowest bit of the tag's 16 height bits says "trail". Half of all packed heights have that bit set, so `steady_tag` clears it (`a_steady_quads_tag_is_never_read_as_a_trail_whatever_its_height`): the first build read every odd-height quad as a trail and the capture diff passed by luck, because a trail at `τ = 0` is the steady plume. `begin_smoke_tails` runs its quad loop only on a frame with a new `Snuff` somewhere (`Added<Snuff>` is the early out), and `update_smoke`'s clock tick must not sit behind a test for "does this system own any quad", because a trail quad is excluded from its query.
+- **`cargo test` hides holes in a trimmed feature list**, because the full-`bevy` dev-dependency
+  unifies features into the library graph. `cargo build` alone compiles a consumer's view.
+- **A site with `FlameTongues` has several `Flame` children, and everything that finds "the flame of a site" must mean the first.** An extra tongue is a `Flame` tagged `FlameTongue` (so `update_flames` gives it the catch, the snuff, the wind and its own culling box for free), and the sparks and the smoke are one quad each on the middle flame: `dress_embers` and `dress_smoke` skip `With<FlameTongue>`, and a new system that dresses "the flame" of a site must too (a test that counts `With<Flame>` children per site counts the tongues as well). A tongue's inward lean rides the instance scale's `y` and `z` with the wind's (`update_flames` adds `FlameTongue::lean`, turned by the site's `GlobalTransform`, and caps the sum at `FLAME_TILT_LIMIT`'s sine): the shader reads one lean per flame, so a second source of lean is a sum, never a second channel. A change to `FlameTongues` rebuilds the extras (`Tongued` is the count and the spread bits they were built from, so a `NaN` spread compares equal to itself and is the middle flame alone, not a rebuild a frame); the middle flame is the site's own and is never rebuilt, and a change to the site's height or phase moves no tongue, as it moves no flame.
+- **A glow over the fire's own pool needs a dark of its own to be read against, and `Image::new` panics in a debug build on a mip chain.** The first `FuelBed` was an additive disc (as the flame is): over the ground the same fire had lit orange it was a cloud, with nothing dark between the lumps. The disc is an opaque cut-out (`AlphaMode::Mask`, a `discard` past its ragged edge, `ASH` under the glow) drawn before every transparent layer, so the additive flames still burn over it; it writes no prepass, so a host with a `DepthPrepass` is unaffected. `Image::new` `debug_assert`s that the data is one level's size, so a texture with its mips in the same buffer (`field_image`) is made with `Image::new_uninit` and filled: a release capture passed and `cargo test` (a debug build, what a host develops in) caught it. A headless test app has no plugin that gives a `Mesh3d` its `Visibility`, so a system that writes it spawns it explicitly. The shader's `RAMP_FIELD`, `RAMP_HEAT` and `RAMP_LEN` mirror `model::bed`'s `BED_RAMP_FIELD`, `BED_RAMP_HEAT` and their product: a mismatch is a uniform buffer of the wrong size, which wgpu refuses loudly. The bed's brightness is steep in temperature (a blackbody roughly doubles per 25 K near 1200 K), so every heat-to-brightness number is small: `BED_BREATH` 0.06 is a 16 % swing in the hottest coal at a campfire flame's deepest dip, and `BED_COOL_KELVIN` 450 is a factor of ten thousand (measured: 9 400).
+- **A `PoolCandidate` with no colour takes the pool template's, and the template's default is white; a `Fire` is where "arrived" and "changed" differ.** The first `Fire` drawn (the six kinds of `examples/fires.rs`) was orange flames over a white pool: a candidate that names no colour leaves the slot's light as the template has it, and `LightPool::light` is a plain `PointLight`. A `Fire` with no colour therefore sets a `FIRE_KELVIN` (1900 K) light, asserted for every kind in `tests/fire.rs`; a hand-built `PoolCandidate` still needs the template's colour (or its own) set by the host. `expand_fires` is one system over `Query<(Entity, Ref<Fire>), Changed<Fire>>`: `Ref::is_added()` splits a `Fire` that has just arrived (each part is written with `insert_if_new`, so what the host spawned beside it wins, as a required component's explicit value does) from one changed afterwards (every part is written again and an extra the fields no longer name is removed). A `Fire` written in place with `get_mut` re-expands, so BRP and a reflection panel work; **the parts are rewritten**, so a host edit on a part stands only until the `Fire` next changes. A `Fire` cannot be a `#[require]`: the parts depend on its fields' values. `FireKind::fire` (a `(FlameSite, PoolCandidate)` pair that could not carry the optional extras) is gone for it.

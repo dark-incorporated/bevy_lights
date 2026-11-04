@@ -17,18 +17,24 @@ use bevy::light::PointLight;
 use bevy::prelude::*;
 
 use crate::flicker::{Flicker, FlickerPlugin, Kindle, Kindled, Snuff, Snuffed, advance_candidate_fires};
-use crate::model::pool::{fade_factor, fade_out_factor, preferred, shadow_set};
-use crate::model::{
-    DEFAULT_FIRE_DIAMETER, FLICKER_DEPTH, SNUFF_SECONDS, kindle_gain, lean_light_shift, snuff_gain,
+use crate::model::pool::{
+    fade_factor, fade_out_factor, focus_quota, preferred, quota_cutoff, shadow_set, shared_value,
 };
+use crate::model::{
+    DEFAULT_FIRE_DIAMETER, FLICKER_DEPTH, SNUFF_SECONDS, kindle_gain, lean_light_shift, relative_air,
+    snuff_gain,
+};
+use crate::motion::MovingSites;
 use crate::{FADE_SECONDS, HYSTERESIS, LightsSystems, chain_sets};
-use crate::{FlameSite, FlameWind};
+use crate::{FlameMotion, FlameSite, FlameVelocity, FlameWind};
 
 /// [`LightPoolPlugin`]: keeps [`LightPool::size`] real lights and hands them to the nearest
 /// [`PoolCandidate`]s.
 ///
-/// Generic over `F`, the host's focus marker: exactly one entity carrying `F` is the point the pool
-/// measures distance from. Add it after [`FlickerPlugin`] — the pool's lights are [`Flicker`]
+/// Generic over `F`, the host's focus marker: the entity carrying `F` is the point the pool measures
+/// distance from. Exactly one by default; with [`FocusRule::Shared`], one per viewer (a split screen's
+/// players, a map camera beside the player's), and the pool's lights are shared between them. Add it
+/// after [`FlickerPlugin`] — the pool's lights are [`Flicker`]
 /// lights, and [`Plugin::finish`] reports a missing flicker plugin with an `error!` rather than
 /// panicking or adding one itself.
 pub struct LightPoolPlugin<F: Component> {
@@ -99,7 +105,8 @@ pub struct LightPool {
     /// How many real lights exist. Shrinking it despawns the extra lights on the next frame; growing
     /// it spawns more.
     pub size: usize,
-    /// How far from the focus a candidate may be, in world units, to be given a light.
+    /// How far from the focus a candidate may be, in world units, to be given a light: from the nearest
+    /// focus, under [`FocusRule::Shared`].
     pub reach: f32,
     /// A dimmer shared by the whole pool, usually how lit the night is (0 puts every pool light
     /// out). Applied on top of each candidate's own intensity.
@@ -137,9 +144,19 @@ pub struct LightPool {
     /// How the pool ranks its candidates: by the illuminance each would put on the subject (the default)
     /// or by distance alone.
     pub rank: Rank,
+    /// Whether the pool serves one viewer or several: [`FocusRule::One`] (the default) needs exactly one
+    /// entity carrying the host's focus marker, [`FocusRule::Shared`] takes any number and shares
+    /// [`LightPool::size`] between them. See [`FocusRule`].
+    pub focus: FocusRule,
     /// How many extra lights the pool keeps beyond the ones it assigns, so a hand-off can be a
     /// **cross-fade**: the departing owner's light fades out while the arriving one fades in, and the
     /// subject never brightens or darkens.
+    ///
+    /// The departing light keeps moving with the candidate it fades out — its position, its
+    /// [`PoolCandidate::offset`] and the flame's lean in the wind, as the arriving light works them out —
+    /// for as long as that candidate is in the pool, so both ends of a cross-fade of one light stand on one
+    /// point; once the candidate has left it (hidden, out of reach, despawned) the light stays where it
+    /// last stood.
     ///
     /// It is also the pool's **hand-off budget**: a reserve light is busy for the whole fade it carries,
     /// so the pool changes at most `reserve` lights' owners in a frame and the rest wait for the next
@@ -167,7 +184,10 @@ pub struct LightPool {
     /// up to `max_shadowed + reserve` lights cast shadows. A pool with shadows wants `reserve: 2`: on the
     /// courtyard, with one reserve shared by hand-offs and shadow changes, three shadows were all placed
     /// in 39 % of frames; with two, in 99 %. A change to this field or to the template's flag is a
-    /// settings change, and applies to every light at once.
+    /// settings change, and applies to every light at once, the reserves' included: with the flag off, or a
+    /// cap of `Some(0)`, a reserve fading a light out does so without its shadow, on that frame. A cap
+    /// lowered to a number above zero reaches the slots at once, and a reserve already fading a shadowed
+    /// light out keeps that shadow for the rest of its fade, inside the `max_shadowed + reserve` above.
     pub max_shadowed: Option<usize>,
 }
 
@@ -179,6 +199,7 @@ impl Default for LightPool {
             gain: 1.0,
             light: PointLight { intensity: 0.0, range: 10.0, shadow_maps_enabled: false, ..default() },
             rank: Rank::Illuminance,
+            focus: FocusRule::One,
             hysteresis: HYSTERESIS,
             fade_seconds: FADE_SECONDS,
             reserve: 1,
@@ -293,6 +314,44 @@ pub enum Rank {
     Distance,
 }
 
+/// How many viewers [`LightPool`] serves: one focus, or several that share its lights.
+///
+/// A game with one camera has one focus, and the pool measures "near" from it. A game with several
+/// (local split-screen co-op, a map camera beside the player's, a cutscene camera while the player stands
+/// elsewhere) cannot name one point that is near for all of them, and the craft is the multi-camera
+/// cinematographer's: the lighting is a compromise, and the question is who pays for it
+/// (`docs/research/pool-foci.md`).
+///
+/// The pool is **shared, not multiplied**: [`LightPool::size`] is the total for every viewer, so a host
+/// whose budget is per view raises it itself (two views at 16 lights each is `size: 32`).
+///
+/// It is a setting and not a behaviour change because a host that spawns two foci by mistake should be
+/// told, which [`FocusRule::One`] still does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FocusRule {
+    /// Exactly one entity carries the focus marker. With none the pool is dark; with more than one it is
+    /// dark and a warning names the setting that serves several. The rule before [`FocusRule::Shared`]
+    /// existed.
+    #[default]
+    One,
+    /// Any number of entities carry the focus marker, one for each viewer, and the pool's lights are
+    /// shared between them.
+    ///
+    /// Each focus is entitled to [`focus_quota`]`(size, foci)` lights, `ceil(size / foci)`, and ranks the
+    /// candidates within [`LightPool::reach`] of it by [`LightPool::rank`]; a candidate's place in the
+    /// pool's one ordering is its best place among the viewers it is near, measured against each viewer's
+    /// own share ([`shared_value`]). So a viewer standing among twenty fires cannot take the lights of one
+    /// standing by three: both keep their nearest, and what a viewer does not use goes to the other. A
+    /// fixture near two viewers holds one light. The hand-off, the reserve cross-fade, the shadow budget
+    /// and [`PoolBudget`] work as for one focus, on that one ordering; a focus that appears or goes (a
+    /// player joining or dropping out) re-divides the lights through the ordinary hand-off, a reserve
+    /// light cross-fading each light that changes owner as [`LightPool::reserve`] allows.
+    ///
+    /// With exactly one focus this is [`FocusRule::One`], to the bit.
+    Shared,
+}
+
 /// A prop that would like one of the pool's real lights: how bright it burns, and where its light
 /// sits relative to the prop's origin.
 ///
@@ -321,9 +380,11 @@ pub struct PoolCandidate {
     ///
     /// A fire's light belongs at the middle of the flame drawn on it —
     /// [`flame_light_offset`](crate::model::reach::flame_light_offset)`(height)` is that point, relative
-    /// to the `FlameSite`'s own origin — and a candidate spawned **on the `FlameSite` entity** therefore
-    /// needs no offset at all: its translation is already the flame's foot. A candidate on a *parent* of
-    /// the flame adds only the difference between the two positions.
+    /// to the `FlameSite`'s own origin, which is the flame's foot — so a candidate spawned **on the
+    /// `FlameSite` entity** takes that point as its `offset` ([`FireKind::candidate`](crate::FireKind::candidate)
+    /// does). With `offset` zero the light would stand at the foot, and the wind's lean, which moves the flame's
+    /// *middle*, would then sink it below the coal bed. A candidate on a *parent* of the flame adds only the
+    /// difference between the two positions.
     ///
     /// Adding the flame's height to a candidate that already sits at the flame puts the light above the
     /// fire, where nothing visible emits it, and loses the sizing: a torch sized for 250 lx at 2 m
@@ -349,6 +410,13 @@ pub struct PoolCandidate {
     /// `None` (the default) is [`FLICKER_DEPTH`](crate::FLICKER_DEPTH). A slot adopts it with the
     /// candidate and takes the default again when the next candidate has none.
     pub depth: Option<f32>,
+    /// The colour of the fire's light, when it is not the pool's: the same value as the
+    /// [`FlameSite::color`](crate::FlameSite::color) of the flame drawn on this prop, so the flame and the light it
+    /// throws are one colour (`docs/research/fire-colour.md`). A slot takes it with the candidate, on the frame the
+    /// owner changes (the light is fading in from nothing then) while the light fading out keeps its owner's, and
+    /// puts the colour it had back when the next candidate has none. `None` (the default) leaves the light as the
+    /// template ([`LightPool::light`]'s colour, or a host's palette) has it.
+    pub color: Option<Color>,
 }
 
 impl PoolCandidate {
@@ -380,6 +448,12 @@ impl PoolCandidate {
         }
         if let Some(d) = self.depth {
             within(&mut out, "depth", d, 0.0, crate::MAX_FLICKER_DEPTH);
+        }
+        if let Some(color) = self.color {
+            let color = LinearRgba::from(color);
+            non_negative(&mut out, "color.red", color.red);
+            non_negative(&mut out, "color.green", color.green);
+            non_negative(&mut out, "color.blue", color.blue);
         }
         out
     }
@@ -513,8 +587,13 @@ fn apply_shared(look: &PointLight, light: &mut Mut<PointLight>) {
 type Assignment = (f32, f32, f32, Entity, Vec3, f32);
 
 /// What `assign_pool` reads of a candidate: its entity, its propagated position, its own `Transform`
-/// when it has one (the freshest truth in the frame the host moved it), whether it is hidden, and how
-/// it wants its light.
+/// when it has one (the freshest truth in the frame the host moved it), whether it is hidden, whether its
+/// fire is out, and how it wants its light.
+///
+/// The fire's [`Snuff`] is read here, with the row, and not looked up by entity: a fire that is out keeps
+/// its `Snuff` for as long as the host leaves it out, so a town at dawn has thousands of them, and a
+/// search through the ones that are out for each candidate was quadratic in them (issue #11). An optional
+/// column is matched once per table, so a world that never snuffs a fire pays a boolean a candidate.
 type CandidateRead<'w, 's> = Query<
     'w,
     's,
@@ -524,23 +603,99 @@ type CandidateRead<'w, 's> = Query<
         Option<&'static Transform>,
         Option<&'static ChildOf>,
         Option<&'static Visibility>,
+        Option<&'static Snuff>,
         &'static PoolCandidate,
     ),
     Without<PoolLight>,
 >;
 
-/// A pool light as it last stood: where, how bright (its candidate's intensity, before the pool's gain
-/// and fade), its flicker, and whether it cast a shadow. A reserve light fading a light out takes all of
-/// it, so the light that leaves keeps moving, and shadowing, exactly as the one that left did —
-/// otherwise the departing and arriving lights swing out of step and their sum wobbles.
+/// Whether a candidate wants a light at all. Not `Visibility::Hidden`: a candidate with no `Visibility` at all
+/// is not hidden. And not out: a candidate whose `Snuff` has run its course wants no light, and a `Snuff` in
+/// progress still does.
+#[inline]
+fn wants_light(visibility: Option<&Visibility>, snuff: Option<&Snuff>) -> bool {
+    !visibility.is_some_and(|v| *v == Visibility::Hidden)
+        && !snuff.is_some_and(|snuff| snuff.elapsed >= SNUFF_SECONDS)
+}
+
+/// The freshest position the frame has for a candidate. A **root** prop with its own `Transform` has just
+/// been moved by the host, and its `GlobalTransform` will not catch up until `PostUpdate`, so its local
+/// translation is the freshest truth. A **child** (a torch in a hand) is placed by its parent: its own
+/// `Transform` is a constant local offset, and reading it would put every torch at the same point — which
+/// is the bug this arity fixes — so a child always uses its `GlobalTransform`.
+#[inline]
+fn freshest(at: &GlobalTransform, transform: Option<&Transform>, parent: Option<&ChildOf>) -> Vec3 {
+    match (parent, transform) {
+        (None, Some(transform)) => transform.translation,
+        _ => at.translation(),
+    }
+}
+
+/// The pool's one quantity: what it **ranks** by and what the overlap rule **holds** against, in the units
+/// the hysteresis margin applies to. "Smaller is better", and positive — `preferred` clamps at zero, so a
+/// negated brightness would collapse every comparison to `0 < 0`.
+///
+/// `Illuminance` is the reciprocal of the light arriving at the subject, `distance² / intensity`: the
+/// inverse square the crate's `fire_lumens` inverts, so a prop four times as bright ranks exactly equal at
+/// twice the distance (which is what the tie-break on entity depends on), and a challenger must arrive 15 %
+/// brighter to take a light. `Distance` is the distance itself, the pair the old rule compared, so that rule
+/// is unchanged.
+#[inline]
+fn rank_value(rank: Rank, distance_squared: f32, intensity: f32) -> f32 {
+    match rank {
+        Rank::Illuminance => distance_squared / intensity.max(1e-6),
+        Rank::Distance => distance_squared.sqrt(),
+    }
+}
+
+/// A pool light as it last stood: whose light it was, where (the point its `Transform` was given: the
+/// candidate's position plus offset plus the flame's lean), how bright (its candidate's intensity at the level it was
+/// shown at: after the fade it was in the middle of, before the pool's gain), its flicker, and whether it cast a shadow. A reserve light fading a light out
+/// takes all of it, so the light that leaves keeps moving, and shadowing, exactly as the one that left did —
+/// otherwise the departing and arriving lights swing out of step and their sum wobbles. `at` is where it
+/// last stood, not where it stands: while `owner` is still in the pool the reserve re-reads that candidate's
+/// light point every frame, and `at` only holds the last point it followed it to.
 #[derive(Clone, Copy)]
 struct LastLight {
+    owner: Entity,
     at: Vec3,
     intensity: f32,
     phase: f32,
     diameter: Option<f32>,
     depth: f32,
     shadow: bool,
+    /// The colour the departing owner's light was tinted to, if its candidate asked for one.
+    tint: Option<Color>,
+}
+
+/// Tints a pool light to a candidate's colour, or puts it back.
+///
+/// With `want` set the light takes that colour and `tints` remembers the colour it had, once; with `None` a light
+/// the crate tinted gets that colour back and a light it never tinted is left alone, so a host's palette (a colour it
+/// wrote itself) survives candidates that have no colour. Written only on a change: a light already the right colour is
+/// not marked changed.
+fn paint(
+    tints: &mut std::collections::HashMap<usize, Color>,
+    slot: usize,
+    light: &mut Mut<PointLight>,
+    want: Option<Color>,
+) {
+    match want {
+        Some(color) => {
+            let before = light.color;
+            tints.entry(slot).or_insert(before);
+            if before != color {
+                light.color = color;
+            }
+        }
+        None => {
+            if let Some(before) = tints.remove(&slot)
+                && light.color != before
+            {
+                light.color = before;
+            }
+        }
+    }
 }
 
 /// The pool's memory between frames: what each slot holds, how long since each slot last changed
@@ -568,6 +723,19 @@ struct HandOffState {
     old_look: std::collections::HashMap<Entity, LastLight>,
     /// Which reserve light is fading out which light, by slot index.
     departure_release: std::collections::HashMap<usize, LastLight>,
+    /// The colour each light the crate tinted to a candidate's ([`PoolCandidate::color`]) had before, by slot index
+    /// (reserves included): what [`paint`] puts back.
+    tints: std::collections::HashMap<usize, Color>,
+    /// This frame's foci: none, one, or (under [`FocusRule::Shared`]) one per viewer. Scratch, kept for
+    /// its capacity.
+    foci: Vec<Vec3>,
+    /// Under [`FocusRule::Shared`] with several foci: each candidate's rank value from each focus,
+    /// `foci.len()` numbers a candidate in the order of the list, [`f32::INFINITY`] where the candidate is
+    /// beyond that focus's reach. Scratch, kept for its capacity.
+    shares: Vec<f32>,
+    /// One focus's column of `shares`, and every focus's cutoff ([`quota_cutoff`]). Scratch.
+    column: Vec<f32>,
+    cutoffs: Vec<f32>,
 }
 
 /// Spawns, resizes and assigns the pool's real lights.
@@ -578,11 +746,13 @@ struct HandOffState {
 ///    `size`. When [`LightPool::light`] changed, every field of it but `intensity` and
 ///    `shadow_maps_enabled` is copied onto every slot, reserves included; each slot's intensity is left
 ///    to the assignment and its shadow flag to the shadow budget.
-/// 2. **Focus.** The one entity carrying `F`. None, or more than one, means no assignment this frame
-///    (and a warning for the second case): a pool with two cameras has no single near.
-/// 3. **Candidates.** Every [`PoolCandidate`] whose own [`Visibility`] is not `Hidden`, within
-///    [`LightPool::reach`], ranked by [`LightPool::rank`] and then by [`Entity`], so the assignment is the
-///    same on every machine and two props of equal rank never swap between frames.
+/// 2. **Foci.** [`FocusRule::One`] (the default): the one entity carrying `F`. None, or more than one,
+///    means no assignment this frame (and a warning for the second case): a pool with two cameras has
+///    no single near unless it is told to share. [`FocusRule::Shared`]: every entity carrying `F`.
+/// 3. **Candidates.** Every [`PoolCandidate`] whose own [`Visibility`] is not `Hidden` and whose fire is not
+///    out (a [`Snuff`] that has run its course), within [`LightPool::reach`], ranked by [`LightPool::rank`]
+///    and then by [`Entity`], so the assignment is the same on every machine and two props of equal rank
+///    never swap between frames.
 /// 4. **Assign.** Every slot's owner for the frame is decided **before any slot is written**: a slot keeps
 ///    its candidate unless a candidate no slot holds is better by [`LightPool::hysteresis`], and a
 ///    challenger takes the **worst-ranked** light the pool holds rather than displacing every slot that
@@ -602,15 +772,28 @@ fn assign_pool<F: Component>(
     focus: Query<&GlobalTransform, With<F>>,
     candidates: CandidateRead,
     fires: Query<(Option<&Kindle>, Option<&Snuff>), With<PoolCandidate>>,
-    snuffs: Query<(Entity, &Snuff), With<PoolCandidate>>,
-    sites: Query<&FlameSite>,
+    sites: Query<(&FlameSite, &FlameVelocity)>,
     wind: Option<Res<FlameWind>>,
+    motion: Option<Res<FlameMotion>>,
+    moving: Option<Res<MovingSites>>,
     mut slots: Query<(Entity, &PoolLight, &mut Transform, &mut Visibility, &mut Flicker, &mut PointLight)>,
     mut state: Local<HandOffState>,
     time: Res<Time>,
 ) {
     let delta = time.delta_secs();
-    let HandOffState { held, fade_at, applied, shadow_settings, old_look, departure_release } = &mut *state;
+    let HandOffState {
+        held,
+        fade_at,
+        applied,
+        shadow_settings,
+        old_look,
+        departure_release,
+        tints,
+        foci,
+        shares,
+        column,
+        cutoffs,
+    } = &mut *state;
     let existing: Vec<(Entity, usize)> =
         slots.iter().map(|(entity, light, ..)| (entity, light.slot)).collect();
 
@@ -645,72 +828,102 @@ fn assign_pool<F: Component>(
         for (_, _, _, _, _, mut light) in &mut slots {
             apply_shared(&look, &mut light);
         }
+        // Every light is the template's colour now, tinted or not: what a tint goes back to is the new one.
+        tints.clear();
         *applied = Some(look);
     }
 
-    // 2. Focus: exactly one entity, or none.
-    let focus_at = {
-        let mut found = focus.iter();
-        match (found.next(), found.next()) {
-            (Some(at), None) => Some(at.translation()),
-            (Some(_), Some(_)) => {
-                let count = 2 + found.count();
-                warn_once!(
-                    "bevy_lights: LightPoolPlugin found {count} focus entities; the pool needs exactly one"
-                );
-                None
+    // 2. Foci: exactly one entity under `FocusRule::One`, any number under `FocusRule::Shared`.
+    foci.clear();
+    match pool.focus {
+        FocusRule::One => {
+            let mut found = focus.iter();
+            match (found.next(), found.next()) {
+                (Some(at), None) => foci.push(at.translation()),
+                (Some(_), Some(_)) => {
+                    let count = 2 + found.count();
+                    warn_once!(
+                        "bevy_lights: LightPoolPlugin found {count} focus entities; the pool needs exactly one (or `LightPool::focus` set to `FocusRule::Shared`)"
+                    );
+                }
+                _ => {}
             }
-            _ => None,
         }
-    };
+        FocusRule::Shared => foci.extend(focus.iter().map(|at| at.translation())),
+    }
 
     // 3. Candidates: visible, in reach, and ranked by the pool's rule — highest illuminance on the subject
     //    first (or nearest first), ties by entity.
-    // Fires that are out: a candidate whose `Snuff` has run its course wants no light. Empty (no allocation) for a
-    // pool whose candidates never go out.
-    let out: Vec<Entity> =
-        snuffs.iter().filter(|(_, snuff)| snuff.elapsed >= SNUFF_SECONDS).map(|(entity, _)| entity).collect();
-    let mut lit: Vec<Assignment> = match focus_at {
-        Some(focus_at) if pool.gain > 0.0 => candidates
-            .iter()
-            // Not `Visibility::Hidden`: a candidate with no `Visibility` at all is not hidden.
-            .filter(|(entity, .., visibility, _)| {
-                !visibility.is_some_and(|v| *v == Visibility::Hidden) && !out.contains(entity)
-            })
-            .map(|(entity, at, transform, parent, _, candidate)| {
-                // The freshest position the frame has. A **root** prop with its own `Transform` has just
-                // been moved by the host, and its `GlobalTransform` will not catch up until `PostUpdate`,
-                // so its local translation is the freshest truth. A **child** (a torch in a hand) is
-                // placed by its parent: its own `Transform` is a constant local offset, and reading it
-                // would put every torch at the same point — which is the bug this arity fixes — so a
-                // child always uses its `GlobalTransform`.
-                let position = match (parent, transform) {
-                    (None, Some(transform)) => transform.translation,
-                    _ => at.translation(),
-                };
-                let distance_squared = position.distance_squared(focus_at);
-                // The value is the pool's one quantity: what it **ranks** by and what the overlap rule
-                // **holds** against, in the units the hysteresis margin applies to. "Smaller is better",
-                // and positive — `preferred` clamps at zero, so a negated brightness would collapse every
-                // comparison to `0 < 0`.
-                //
-                // `Illuminance` is the reciprocal of the light arriving at the subject,
-                // `distance² / intensity`: the inverse square the crate's `fire_lumens` inverts, so a prop
-                // four times as bright ranks exactly equal at twice the distance (which is what the
-                // tie-break on entity depends on), and a challenger must arrive 15 % brighter to take a
-                // light. `Distance` is the distance itself, the pair the old rule compared, so that rule is
-                // unchanged.
-                let value = match pool.rank {
-                    Rank::Illuminance => distance_squared / candidate.intensity.max(1e-6),
-                    Rank::Distance => distance_squared.sqrt(),
-                };
-                let key = value;
-                (key, distance_squared, value, entity, position + candidate.offset, candidate.intensity)
-            })
-            .filter(|(_, distance_squared, ..)| *distance_squared <= pool.reach * pool.reach)
-            .collect(),
-        _ => Vec::new(),
+    let reach_squared = pool.reach * pool.reach;
+    let single = match foci.as_slice() {
+        [at] => Some(*at),
+        _ => None,
     };
+    shares.clear();
+    let mut lit: Vec<Assignment> = match single {
+        _ if foci.is_empty() || pool.gain <= 0.0 => Vec::new(),
+        // One focus: the plain rule.
+        Some(focus_at) => candidates
+            .iter()
+            .filter(|(.., visibility, snuff, _)| wants_light(*visibility, *snuff))
+            .map(|(entity, at, transform, parent, _, _, candidate)| {
+                let position = freshest(at, transform, parent);
+                let distance_squared = position.distance_squared(focus_at);
+                let value = rank_value(pool.rank, distance_squared, candidate.intensity);
+                (value, distance_squared, value, entity, position + candidate.offset, candidate.intensity)
+            })
+            .filter(|(_, distance_squared, ..)| *distance_squared <= reach_squared)
+            .collect(),
+        // Several foci: each candidate's value from each focus it is within reach of is kept in `shares` (a
+        // row of `foci.len()` numbers a candidate, in the order of `lit`, [`f32::INFINITY`] for a focus it
+        // is beyond) until every focus's cutoff is known; the pool's own value is settled below.
+        None => candidates
+            .iter()
+            .filter(|(.., visibility, snuff, _)| wants_light(*visibility, *snuff))
+            .filter_map(|(entity, at, transform, parent, _, _, candidate)| {
+                let position = freshest(at, transform, parent);
+                let row = shares.len();
+                let mut nearest = f32::INFINITY;
+                for focus_at in foci.iter() {
+                    let distance_squared = position.distance_squared(*focus_at);
+                    if distance_squared <= reach_squared {
+                        nearest = nearest.min(distance_squared);
+                        shares.push(rank_value(pool.rank, distance_squared, candidate.intensity));
+                    } else {
+                        shares.push(f32::INFINITY);
+                    }
+                }
+                if nearest.is_infinite() {
+                    shares.truncate(row);
+                    return None;
+                }
+                let value = rank_value(pool.rank, nearest, candidate.intensity);
+                Some((value, nearest, value, entity, position + candidate.offset, candidate.intensity))
+            })
+            .collect(),
+    };
+    // Shared between several foci: each focus's value is its own multiple of its cutoff (the value of its
+    // quota-th best candidate), and a candidate takes its best. See `model::pool::shared_value`.
+    if single.is_none() && !lit.is_empty() {
+        let k = foci.len();
+        let quota = focus_quota(pool.size, k);
+        cutoffs.clear();
+        for at in 0..k {
+            column.clear();
+            column.extend(shares.iter().skip(at).step_by(k).copied().filter(|value| value.is_finite()));
+            cutoffs.push(quota_cutoff(column, quota).unwrap_or(1.0));
+        }
+        for (entry, row) in lit.iter_mut().zip(shares.chunks_exact(k)) {
+            let value = row
+                .iter()
+                .zip(cutoffs.iter())
+                .filter(|(value, _)| value.is_finite())
+                .map(|(value, cutoff)| shared_value(*value, *cutoff))
+                .fold(f32::INFINITY, f32::min);
+            entry.0 = value;
+            entry.2 = value;
+        }
+    }
     // Ties break on `Entity`, never on the value: four times the light at twice the distance is an exact
     // tie by design, and two equidistant props must not swap between frames.
     lit.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.3.to_bits().cmp(&b.3.to_bits())));
@@ -875,9 +1088,10 @@ fn assign_pool<F: Component>(
     //    A light that changes owner (or is a slot's first light) takes its new owner's shadow at once: it
     //    is fading in from nothing anyway, and the reserve fading the old owner out carries the old flag.
     //    A light that **keeps** its owner and gains or loses its shadow is cross-faded to itself: a free
-    //    reserve takes it as it stood and fades it out while the slot fades back in with the new flag, so
-    //    the shadow deepens (or lifts) over the fade and the lit ground around it does not move. That
-    //    waits for a free reserve and for the slot's own fade to finish; with no reserves at all it dips.
+    //    reserve takes it (and then follows its candidate, as the slot does) and fades it out while the slot
+    //    fades back in with the new flag, so the shadow deepens (or lifts) over the fade and the lit ground
+    //    around it does not move. That waits for a free reserve and for the slot's own fade to finish; with
+    //    no reserves at all it dips.
     //    Losses are applied before gains, so a gain that has to wait never puts the pool over budget.
     //
     //    A change of the *settings* (the template's flag, the cap) is not a hand-off: like the template's
@@ -979,12 +1193,39 @@ fn assign_pool<F: Component>(
     let winners: std::collections::HashMap<_, _> = chosen_by_slot
         .values()
         .filter_map(|entity| {
-            candidates
-                .get(*entity)
-                .ok()
-                .map(|(.., candidate)| (*entity, (candidate.phase, candidate.diameter, candidate.depth)))
+            candidates.get(*entity).ok().map(|(.., candidate)| {
+                (*entity, (candidate.phase, candidate.diameter, candidate.depth, candidate.color))
+            })
         })
         .collect();
+
+    // Where a candidate's light stands relative to the point the pool puts it at: a flame leaning in the
+    // wind has its middle, and so its light, off the upright axis. The site is the candidate's own, or the
+    // one that names it as its `fire`. `diameter` is the candidate's own fire diameter, if it gives one.
+    // One rule for the slot and for the reserve fading the same light out, so the two ends of a cross-fade
+    // cannot stand apart.
+    let wind_velocity = wind.as_deref().map_or(Vec2::ZERO, |wind| wind.velocity);
+    let gain = motion.as_deref().map_or(1.0, |motion| motion.gain);
+    let searching = wind_velocity != Vec2::ZERO || moving.as_deref().is_some_and(|moving| moving.0 > 0);
+    let lean_of = |entity: Entity, diameter: Option<f32>| -> Vec3 {
+        // The candidate's own site is one lookup; the site that names it as its `fire` is a search, so with nothing blowing and
+        // nothing moving it is not made.
+        let found = sites.get(entity).ok().or_else(|| {
+            searching.then(|| sites.iter().find(|(site, _)| site.fire == Some(entity))).flatten()
+        });
+        let Some((site, travel)) = found.map(|(site, travel)| (site, travel.ground)) else {
+            return Vec3::ZERO;
+        };
+        // The air the fire meets: the wind less the fire's own velocity, as the flame's lean is drawn from.
+        let air = Vec2::from(relative_air(wind_velocity.to_array(), travel.to_array(), gain));
+        let speed = air.length();
+        if !(speed > 0.0 && speed.is_finite()) {
+            return Vec3::ZERO;
+        }
+        let diameter = diameter.or(site.diameter).unwrap_or(DEFAULT_FIRE_DIAMETER);
+        let toward = air / speed;
+        Vec3::from(lean_light_shift(site.height, speed, diameter, [toward.x, toward.y]))
+    };
 
     for (_, slot, mut transform, mut visibility, mut flicker, mut light) in &mut slots {
         // A reserve light: it is not assigned a candidate, only used to fade a departure out.
@@ -999,21 +1240,40 @@ fn assign_pool<F: Component>(
             // On while there is light left to fade; the frame the fade ends it is hidden and freed, so a
             // finished reserve is never a dark light (or a dark shadow map) the renderer still draws.
             if out > 0.0
-                && let Some(last) = live
+                && let Some(mut last) = live
             {
+                // The departing light is a candidate's light, and it stands where that light does now: the
+                // candidate's position plus offset plus lean, as the slot works it out. A light cross-faded
+                // to itself therefore has both ends on one point, and a light displaced by a nearer one
+                // keeps moving with its torch. Once the candidate has left the pool (hidden, out of reach,
+                // despawned) there is no "now", and the light holds the last point it followed it to.
+                if let Some(at) = lit
+                    .iter()
+                    .find(|(_, _, _, candidate, ..)| *candidate == last.owner)
+                    .map(|(.., at, _)| *at)
+                {
+                    last.at = at + lean_of(last.owner, last.diameter);
+                    departure_release.insert(slot.slot, last);
+                }
                 transform.translation = last.at;
                 // The departing light keeps the flicker it had (the phase, rate and depth of the light that
                 // left), so the two ends of the cross-fade move together instead of beating against each
-                // other, and its shadow, so a shadow leaves with its light.
+                // other, and its shadow, so a shadow leaves with its light — while the pool has a shadow
+                // budget at all. The snapshot was taken under last frame's settings, so a template flag
+                // turned off, or a cap of nothing, reaches the reserve here, on the frame it is made.
                 flicker.phase = last.phase;
                 flicker.diameter = last.diameter;
                 flicker.depth = last.depth;
                 flicker.base = last.intensity * pool.gain * out;
-                if light.shadow_maps_enabled != last.shadow {
-                    light.shadow_maps_enabled = last.shadow;
+                let shadow = last.shadow && shadow_budget > 0;
+                if light.shadow_maps_enabled != shadow {
+                    light.shadow_maps_enabled = shadow;
                 }
+                // And its colour: the light fading out is the colour it was, whatever the next owner's is.
+                paint(tints, slot.slot, &mut light, last.tint);
                 visibility.set_if_neq(Visibility::Inherited);
             } else {
+                paint(tints, slot.slot, &mut light, None);
                 flicker.base = 0.0;
                 if light.shadow_maps_enabled {
                     light.shadow_maps_enabled = false;
@@ -1056,36 +1316,14 @@ fn assign_pool<F: Component>(
         }
         match assigned {
             Some((at, intensity, entity)) => {
-                // A flame leaning in the wind has its middle, and so its light, off the upright axis. The
-                // site is the candidate's own, or the one that names it as its `fire`.
-                let lean = match &wind {
-                    Some(wind) if wind.velocity != Vec2::ZERO => {
-                        match sites.get(entity).ok().or_else(|| sites.iter().find(|s| s.fire == Some(entity)))
-                        {
-                            Some(site) => {
-                                let speed = wind.velocity.length();
-                                let diameter = winners
-                                    .get(&entity)
-                                    .and_then(|(_, diameter, _)| *diameter)
-                                    .or(site.diameter)
-                                    .unwrap_or(DEFAULT_FIRE_DIAMETER);
-                                let toward = wind.velocity / speed;
-                                Vec3::from(lean_light_shift(
-                                    site.height,
-                                    speed,
-                                    diameter,
-                                    [toward.x, toward.y],
-                                ))
-                            }
-                            None => Vec3::ZERO,
-                        }
-                    }
-                    _ => Vec3::ZERO,
-                };
+                // A flame leaning in the wind has its middle, and so its light, off the upright axis.
+                let lean = lean_of(entity, winners.get(&entity).and_then(|(_, diameter, ..)| *diameter));
                 transform.translation = at + lean;
                 // The slot keeps its own phase until a candidate says otherwise: the light handed to a
                 // prop must breathe on that prop's clock, or it beats against the flame drawn on it.
-                if let Some((phase, diameter, depth)) = winners.get(&entity).copied() {
+                let color = winners.get(&entity).and_then(|(.., color)| *color);
+                paint(tints, slot.slot, &mut light, color);
+                if let Some((phase, diameter, depth, _)) = winners.get(&entity).copied() {
                     if let Some(phase) = phase {
                         flicker.phase = phase;
                     }
@@ -1110,16 +1348,20 @@ fn assign_pool<F: Component>(
             }
         }
         // Remember how this slot's light now stands, so a departure next frame fades out exactly this.
-        if let Some((at, intensity, ..)) = assigned {
+        if let Some((_, intensity, entity)) = assigned {
             old_look.insert(
-                chosen.unwrap_or(Entity::PLACEHOLDER),
+                entity,
                 LastLight {
-                    at,
-                    intensity,
+                    owner: entity,
+                    at: transform.translation,
+                    // The level it was shown at, not the full intensity it was heading for: a light handed on in the
+                    // middle of its own fade-in fades out from the few per cent it had reached.
+                    intensity: intensity * fade,
                     phase: flicker.phase,
                     diameter: flicker.diameter,
                     depth: flicker.depth,
                     shadow,
+                    tint: winners.get(&entity).and_then(|(.., color)| *color),
                 },
             );
         }

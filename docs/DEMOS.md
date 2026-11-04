@@ -136,7 +136,7 @@ while the light flares (a tongue at 45, full height by 49).
 system sets, because a total tells you a change cost something and not *what*:
 
 ```text
-bench_lights candidates=5000 lights=2000 pool=16 frames=600 mean_us=… p50_us=… min_us=… max_us=…
+bench_lights candidates=5000 lights=2000 pool=16 snuffed=0 frames=600 mean_us=… p50_us=… min_us=… max_us=…
 bench_lights_systems flicker_p50_us=170 pool_p50_us=306
 ```
 
@@ -148,6 +148,10 @@ no intensity — because a per-system line from a switch that does nothing would
 At 5 000 candidates and 2 000 lights the split is roughly **170 µs flicker, 310 µs pool**: the pool is the
 expensive half, which is what a change to the pool's sort should move.
 
+`BENCH_SNUFFED=<n>` puts the first `n` candidates out, each with a finished `Snuff`: the pool at dawn, or a saved scene
+whose torches were put out. Run it at 0 and at `BENCH_CANDIDATES` alternately; the two `pool_p50_us` should agree
+(the pool must meet a fire that is out at no more than the cost of a lit one).
+
 ## The bench, and the host
 
 `cargo run --release --example bench_lights` is CPU-only, so it measures the host as much as the crate.
@@ -156,6 +160,82 @@ binary reports p50 495, then 856, then 865 µs — that is the load, not the cod
 building the base commit and the change into **separate target directories** and running the two
 binaries **interleaved**, three rounds each; a reading whose repeat moves by more than 10 % is thrown
 away.
+
+## The flame bench: thousands of fires, a few on screen
+
+`bench_lights` has no renderer, so it cannot see a flame. `bench_flames` can: it spawns `BENCH_FLAMES` torches (default 5000) on a 3 m grid, points one camera at a corner of the grid so that about twenty are in view, renders 400 frames to an off-screen image (the first 100 are not counted: the flame material's pipeline compiles in them) and prints
+
+```text
+bench_flames flames=5000 visible=15 embers=0 embers_visible=0 smoke=0 smoke_visible=0 wind=0,0 frames=300 mean_ms=… p50_ms=… min_ms=…
+```
+
+`visible` is the number of flames the renderer counted as in view at the last frame, which is the proof that the others were culled; `BENCH_WIND=3,0` makes every flame lean, so each one's scale and culling box are rewritten every frame; `BENCH_EMBERS=1` gives every torch `FlameEmbers` (a second quad a flame) and `embers_visible` counts those quads the renderer drew. Each `*_ms` is one `App::update()`, the main world and the render world's CPU work together, and the bench needs a GPU adapter. It runs without a display or a window (`DefaultPlugins` with `WinitPlugin` disabled and the camera on an `Image`), so it works over ssh. A GPU busy with other jobs makes `create_render` panic at start-up: check `nvidia-smi` and run it again.
+
+Compare two builds the way `bench_lights` is compared: separate target directories (or a copied binary), interleaved, three rounds. Iteration 277's numbers, best of three on a loaded machine, in ms a frame: 0 flames 1.3 and 1.7 (noise: the order reversed reads the other way), 1 000 flames 2.2 → 1.9, 5 000 7.8 → 2.2, 20 000 30.0 → 6.4, and with `BENCH_WIND=3,0` 5 000 8.0 → 3.1 and 20 000 28.1 → 5.9, before → after culling. What is left, about 0.25 µs a flame, is `update_flames`' own per-flame work and Bevy's visibility pass over the boxes.
+
+Iteration 278's numbers for the ember quads (`BENCH_EMBERS=1`, best of three interleaved runs on a machine at load average 15-26, in ms a frame), before → after the quad got a box of its own: 5 000 flames 11.5 → 4.2, 20 000 37.2 → 9.2, and with `BENCH_WIND=3,0` 5 000 8.8 → 3.6; `embers_visible` fell from every quad in the world to 18-21. A quiet-machine pair before the change (load 18) was 3.7 → 9.5 ms at 5 000 torches without and with sparks, and 9.4 → 46.3 at 20 000. Build the old side as the new `bench_flames.rs` over the old `src/` (`git checkout <old> -- src`), because the old bench has no `BENCH_EMBERS`.
+
+Iteration 281's numbers for the smoke quads (`BENCH_SMOKE=1`: `smoke_visible` counts the quads the renderer drew, 18 of 5 000, 21 in a 3 m/s wind), the old side being the build before `FlameSmoke` (a baseline worktree built to its own target dir, `bench_flames` with no smoke fields), three interleaved rounds on a machine at load average about 30, best `p50_ms` of the three, in ms a frame: **a scene with no smoke is the same** (5 000 flames 2.23 → 2.23, 20 000 flames 4.22 → 4.27); with every torch smoking, 5 000 flames 2.23 → 3.01 and 20 000 4.22 → 7.57, with a 3 m/s wind 5 000 2.18 → 3.12, and a second quad on top of `BENCH_EMBERS=1` 3.07 → 4.03. That is about 0.16 µs a smoking fire a frame, the same class as the sparks' quad (a second entity a fire for Bevy's visibility pass and extraction), paid only by a fire that has the component, and the smoke is culled by the sparks' box when it is off the screen. On the GPU (`LIGHTS_GPU_TIMING=1`, 1280 x 720, the 3 m close-up with 52 smoking fires, four runs alternating) the transparent pass took 79.0 and 69.9 µs without smoke and 85.3 and 85.7 µs with it.
+
+## Seeing the pool serve two viewers
+
+`LIGHTS_FOCI=n` gives the courtyard's pool `n` foci (`FocusRule::Shared`) over the one camera, a cyan marker on each, so an overview shows who the viewers are; `LIGHTS_SPLIT=1` is two viewers with a camera each on the halves of the window (viewers a quarter of the orbit apart, each camera behind its own focus). `LIGHTS_FOCUS_RULE=one` keeps the default rule over the same foci, which leaves the pool dark: the comparison. `LIGHTS_FOCUS_WALK=8` (or 12) sends the foci out so each stands in its own part of the court.
+
+```sh
+LIGHTS_FRAMES=300 LIGHTS_SPLIT=1 LIGHTS_FOCUS_WALK=8 LIGHTS_FOCUS_RULE=one    LIGHTS_SHOT=/tmp/split_one.png    cargo run --release --example courtyard
+LIGHTS_FRAMES=300 LIGHTS_SPLIT=1 LIGHTS_FOCUS_WALK=8                          LIGHTS_SHOT=/tmp/split_shared.png cargo run --release --example courtyard
+magick /tmp/split_shared.png /tmp/split_one.png -compose difference -composite -evaluate Multiply 6 /tmp/split_diff.png
+```
+
+Judge each half separately (`magick f.png -crop 640x720+0+0 +repage -colorspace Gray -format "%[fx:mean*255]" info:`), and the difference image for where the pool lights are. A **moving** camera is a different test from a still one: record a sequence (`LIGHTS_SHOT_DIR`, `LIGHTS_SHOT_FROM=150`) and plot each half's mean luminance per frame; a frame that departs from the mean of its two neighbours by about a DN is a light drawn at a stale intensity (iteration 279 found one at 5.6 DN, in the frame a light entered a camera's view, and fixed it: after, none departs by more than 0.9). A static camera cannot show this. `BENCH_FOCI=n` on `bench_lights` prices the shared pool.
+
+## Seeing a fire's own colour
+
+`LIGHTS_COLOURS=1` gives some of the courtyard's fires a colour of their own, on the flame, its sparks and its light together: braziers 1 and 2 burn a gas-flame blue and a witch-fire green, and every fifth torch a blue or a violet; unset or `0` the courtyard is the scene's orange and draws the same pixels it always did (a capture of it differs from the previous build's by **zero** pixels, which is the check to run after any change to what a flame's colours are made of: `magick compare -metric AE old.png new.png null:`).
+
+```sh
+LIGHTS_FRAMES=300 LIGHTS_COLOURS=1 LIGHTS_SEED=7 LIGHTS_SHOT=/tmp/colours.png cargo run --release --example courtyard      # docs/media/colours.png
+LIGHTS_FRAMES=300 LIGHTS_COLOURS=1 LIGHTS_EMBERS=4 LIGHTS_EYE=-5,2.6,8.4 LIGHTS_LOOK=-5,0.9,5 LIGHTS_SHOT=/tmp/blue.png cargo run --release --example courtyard   # the blue brazier from 3.5 m
+```
+
+A coloured fire is judged by whether the light it throws and the flame it is drawn on are one colour: the stone beside the brazier should lean to the flame's hue and the nearest torch-bearer's near side take it, and the rim and core of the flame should read as the orange flame's do (a darker, more saturated rim, a paler core). A pool light that changes owner between two colours changes colour while it is fading in from nothing, so no frame should depart from the mean of its neighbours by more than the pool's usual pop test in any channel: record a sequence (`LIGHTS_FOCUS_WALK=18 LIGHTS_POOL=4 LIGHTS_HYSTERESIS=1.0 LIGHTS_SHOT_DIR=... LIGHTS_SHOT_EVERY=1 LIGHTS_SHOT_FROM=100`) and plot each channel's mean per frame.
+
+## Seeing the depth fade (`examples/occlusion`)
+
+A torch behind a wall edge leaves a tongue of fire hanging over the stone with nothing under it, unless
+its site has `FlameSite::depth_fade` and its camera a `DepthPrepass` (`docs/research/flame-occlusion.md`).
+`examples/occlusion` is that scene: three torches — one behind the wall, one on its face, one past its end
+— and `LIGHTS_DEPTH_FADE=1` turns the fade on, so the same run is the comparison. `LIGHTS_PAN=1` swings
+the camera down the wall's length, which is what carries the hidden torch's source out past the wall's end
+and back into view:
+
+```sh
+# the pan: the flame goes out while the stone hides its source (big has no display, so Xvfb)
+LIGHTS_FRAMES=272 LIGHTS_PAN=1 LIGHTS_DEPTH_FADE=1 LIGHTS_SHOT_DIR=/tmp/fade \
+  LIGHTS_SHOT_FROM=1 LIGHTS_SHOT_EVERY=2 xvfb-run -a -s "-screen 0 1280x720x24" \
+  ./target/release/examples/occlusion
+# and the two stills it is judged by
+for f in 0 1; do
+  LIGHTS_FRAMES=200 LIGHTS_DEPTH_FADE=$f LIGHTS_EYE=-2.2,1.9,4.2 LIGHTS_LOOK=-2.5,1.9,-1.2 \
+    LIGHTS_SHOT=/tmp/depthfade_$f.png xvfb-run -a -s "-screen 0 1280x720x24" ./target/release/examples/occlusion
+done
+```
+
+`docs/media/depth-fade.gif` is frames 9 to 136 of the first run (the first eight saved frames are black:
+the flame material's pipeline is still compiling), renumbered from 0 and encoded at `FPS=15 STRIDE=2
+WIDTH=640`; 64 frames, 172 KB. `docs/media/depth-fade.png` is the two stills, each cropped to 360 × 230 at
+`+470+250`, doubled with `-filter point`, captioned and appended.
+
+What to look for, and what to measure:
+
+- **The flame's presence follows the source, not the frame.** Read on the region above the wall
+  (`-crop 640x300+320+120`), the peak grey level is 183 to 210 of 255 while the source is visible and 24 at the end of the pan, when the wall is between; the fade is a few pixels of the wall's edge, not a pop.
+- **The comparison still measures it.** The region above the wall (`-crop 160x170+560+260` of the
+  full frame, which is `-crop 720x420+380+280` before the 2x scale and the splice): 1 542 pixels above 60
+  with `LIGHTS_DEPTH_FADE=0`, a peak of 162, and none with it on, a peak of 24.
+- **A site that does not ask for it is unchanged.** `depth_fade: false` (every example's default except
+  this one) draws exactly as before, with no depth read and no `DepthPrepass` needed: the courtyard's
+  captures are pixel-identical to the build before the feature.
 
 ## Seeing a cross-faded hand-off
 
@@ -234,13 +314,118 @@ The frame rate in that log counts from 1 while `LIGHTS_SHOT_DIR`'s numbering sta
 screenshot's `frame0006` is rarely the log's frame 6 — measure the log for the artefact and the images for
 its look, and do not try to line the two up by index.
 
+## Seeing a put-out fire's smoke trail
+
+`FlameSmoke` leaves a trail when the light its flame is linked to gets a `Snuff` (`docs/research/flame-smoke-tail.md`). The courtyard's `LIGHTS_SNUFF=<seconds>` puts every brazier and torch out at that time, and `LIGHTS_SMOKE=0.8 LIGHTS_EMBERS=4` give every flame its smoke and sparks, so a sequence from a close camera is one command:
+
+```sh
+LIGHTS_FRAMES=420 LIGHTS_SNUFF=2.0 LIGHTS_SMOKE=0.8 LIGHTS_EMBERS=4 LIGHTS_EYE=2.4,1.5,7.2 LIGHTS_LOOK=5,1.6,5 \
+  LIGHTS_SHOT_DIR=/tmp/trail LIGHTS_SHOT_FROM=120 LIGHTS_SHOT_EVERY=72 cargo run --release --example courtyard
+```
+
+That is frames 120, 192, 264, 336 and 408: the douse begins at frame 120 (2.0 s), the flame is out by 192 (1.2 s later), and the trail ends, exactly dark, at 5 s (frame 420). Add `LIGHTS_WIND=3,0` to see the trail bend over downwind as it lifts.
+
+What to look for, and what to measure:
+
+- **The flame's end is not the smoke's.** From the second frame on, the column is still there and its base has lifted off the coals; at 2.4 s it has left the bowl and at 3.6 s only its top is left. The old build's smoke was gone with the flame, at about 0.8 s.
+- **No frame pops.** The mean luminance of the column's box, frame by frame (`mean |Δ|` against the frame before, in the same box), is smooth across the douse's first frame and across the trail's last: the build before this change was the same to the DN until the douse began, and the trail's own fade reaches the sky's level (4.15 DN here) at about 4.8 s, a little before its clock stops.
+- **A scene that puts nothing out is unchanged.** The default courtyard and the close camera with `LIGHTS_SMOKE` and `LIGHTS_WIND` are zero pixels different from the build before (`magick compare -metric AE`).
+- **From above it is a point.** A camera looking straight down sees a vertical column end-on, so the top-down view shows nothing of the trail, as it shows nothing of the steady plume; the 3x crop of a brazier at the default 45° camera shows a thin warm wisp rising from the coals.
+
+## Seeing a wide fire's tongues
+
+`examples/campfire.rs` puts a campfire (0.8 m bed, 0.7 m flame) at x = -2.6 and a bonfire (3 m pyre, 2 m flame) at x = 3.4, each a `FireKind` with its light, flame, sparks, smoke and `FlameTongues` (`docs/research/flame-tongues.md`). `LIGHTS_TONGUES=0` draws the same two fires as one flame each, which is the comparison, and every frame below is `LIGHTS_FRAMES=240`:
+
+```sh
+# the campfire from 2.5 m, the bonfire from 5 m, and the same two without tongues
+for t in off on; do
+  E=""; [ $t = off ] && E="LIGHTS_TONGUES=0"
+  env $E LIGHTS_FRAMES=240 LIGHTS_EYE=-0.1,1.1,2.3 LIGHTS_LOOK=-2.6,0.55,0 LIGHTS_SHOT=/tmp/${t}_camp.png cargo run --release --example campfire
+  env $E LIGHTS_FRAMES=240 LIGHTS_EYE=1.4,1.5,5.0 LIGHTS_LOOK=3.4,1.0,-0.6 LIGHTS_SHOT=/tmp/${t}_bon.png cargo run --release --example campfire
+done
+# a sequence: 30 frames, one every 3 (0.05 s), from frame 60
+LIGHTS_FRAMES=150 LIGHTS_SHOT_DIR=/tmp/camp LIGHTS_SHOT_FROM=60 LIGHTS_SHOT_EVERY=3 \
+  LIGHTS_EYE=-0.1,1.1,2.3 LIGHTS_LOOK=-2.6,0.55,0 cargo run --release --example campfire
+```
+
+`docs/media/tongues.png` is those four frames (campfire and bonfire, off and on), each cropped to the fire and the captions burned in. `LIGHTS_WIND=1.5,0` shows the tongues laid over together (the inward lean adds to the wind's), `LIGHTS_SNUFF=1.0` puts both out and every tongue goes with its light, `LIGHTS_TONGUES=n` gives both fires `n` tongues over their kind's spread (a campfire given nine is as wide as its stones), and `LIGHTS_SPREAD=m` sets the width the tongues' feet are spread over.
+
+What to look for, and what to measure:
+
+- **A mound, not a row.** The first build laid the tongues parallel, which read as a crown of candles (bonfire) and a handful of separate flames (campfire); the inward lean (`INWARD_LEAN`, 0.30 at the rim) turns them into one fire that converges on a tip. A frame sequence shows the tongues parting and rejoining on clocks of their own.
+- **A scene that does not use the component is unchanged.** The default courtyard in ten views (ground, edge, top and graze, two seeds with a pool of 4 and of 16, and three far views at 45 and 95 m, one with sparks and smoke) against the build before: seven are zero pixels different and three have one or two pixels off by 1 DN (the GPU's own noise, as in iteration 282); counted with numpy on the two PNGs.
+- **What it costs.** CPU: `BENCH_TONGUES=6 cargo run --release --example bench_flames` (5 000 fires of 6 tongues, 30 000 flames in the world, 88 in view) reads 7.1 to 7.4 ms a frame against 2.6 to 2.9 for 5 000 plain flames: the 25 000 extra flames cost about 0.18 µs each a frame, so a campfire's five extra tongues are about 0.9 µs. GPU: `LIGHTS_GPU_TIMING=1 LIGHTS_FRAMES=420` with the bonfire 5 m from the camera (both fires in view, a third of the screen) reads the transparent pass at 340 and 302 µs without tongues and 504 and 436 µs with them (two rounds, interleaved), the opaque pass unchanged: about 0.15 ms a frame for the two fires, 13 draws more.
+
+## Seeing a bed of coals live
+
+`examples/campfire.rs` lays each of its two fires on its kind's `FuelBed` (`FireKind::bed()`: a campfire's 0.7 m, a bonfire's 1.9 m; `docs/research/fuel-bed-heat.md`). `LIGHTS_BED=0` leaves the coals out (the comparison) and `LIGHTS_COOLING=s` sets their cooling time constant, so a fire put out (`LIGHTS_SNUFF`) can be captured cooling in seconds instead of minutes:
+
+```sh
+# the campfire from straight above, with and without coals, and a frame every 75 frames of a fire put out at 1.0 s
+E="LIGHTS_FRAMES=240 LIGHTS_EYE=-2.6,2.4,0.5 LIGHTS_LOOK=-2.6,0,0"
+env $E LIGHTS_SHOT=/tmp/bed_on.png cargo run --release --example campfire
+env $E LIGHTS_BED=0 LIGHTS_SHOT=/tmp/bed_off.png cargo run --release --example campfire
+LIGHTS_FRAMES=1050 LIGHTS_SHOT_DIR=/tmp/bed_snuff LIGHTS_SHOT_FROM=30 LIGHTS_SHOT_EVERY=75 \
+  LIGHTS_EYE=-2.6,2.4,0.5 LIGHTS_LOOK=-2.6,0,0 LIGHTS_SNUFF=1.0 LIGHTS_COOLING=6 cargo run --release --example campfire
+```
+
+`docs/media/fuel-bed.png` is frames 0, 1, 2 and 4 of that last run (frames 30, 105, 180 and 330), each cropped to 420 x 330 round the bed with the captions burned in: `magick frameNNNN.png -crop 420x330+430+180 +repage -gravity south -background black -fill white -pointsize 18 -splice 0x34 -annotate +0+8 "caption"`, then `+append` and `-append` into a 2 x 2 sheet (a truecolor PNG: 128 colours bands the dark ground).
+
+What to look for, and what to measure:
+
+- **A bed read against dark.** The first build was an additive glow over the ground the same fire had lit, and read as a cloud with nothing dark between the lumps; the disc is an opaque cut-out with its own ash (`ASH` in `src/bed.wesl`), so the lumps are patches of orange and deep red on near-black, with a ragged rim, not a plate. Judge it from 2.4 m straight down, at 45°, and from 1.2 m; at the viewer's eye and at a graze the logs and the stones cover most of it, as they would.
+- **It goes on glowing.** The flame and the light are gone 1.2 s after the douse (`SNUFF_SECONDS`) and the coals stay, orange then red then nothing, with the logs dark against them: the strongest frame of the set is the one 2 s after the douse (frame 2 above). At the default 60 s time constant the hottest coal is under a thousandth of its burning brightness after 104 s (`bed_visible_heat`, 0.18 of the heat).
+- **It breathes.** 61 consecutive frames of a burning bed (`LIGHTS_SHOT_DIR` with `LIGHTS_SHOT_EVERY=1 LIGHTS_SHOT_FROM=100`), the mean grey level of a 40 x 50 patch of bed with no flame over it: 110 to 128 (a standard deviation of 5, about 7 % of its level), rising with the flame's own swing over the same frames.
+- **A scene that does not use the component is unchanged.** The default courtyard in ten views (default, ground, edge, top, graze, seed 3 with a pool of 4 and of 16, far at 45 and 95 m, and the close camera with sparks and smoke, 300 frames, `magick compare -metric AE`) against the build before: eight are zero pixels different and two (seed 3 pool 16, the sparks and smoke view) are one pixel off by 1 DN, the GPU's own noise. The courtyard does not use `FuelBed`.
+- **What it costs.** CPU, interleaved against the build before it on a machine at load average 14-20: a scene with no bed is the same (`bench_lights`, seven alternating runs each: `min_us` 328-378 against 343-385, `p50_us` 534-638 against 553-642). `BENCH_BEDS=1 cargo run --release --example bench_flames` (every torch of 5 000 has a bed, 15 in view; needs a GPU adapter) reads 3.5 ms a frame at best against 2.4 without, about 0.2 µs a bed, and 6.0 and 6.8 in the other two runs of three on the same load; a bed is an entity like a flame, and `update_beds` alone is about 0.06 µs a bed a frame in a headless app (5 000 beds, 300 frames). GPU: `LIGHTS_GPU_TIMING=1 LIGHTS_FRAMES=420` with the bonfire 5 m from the camera reads the opaque pass at 303 and 280 µs before and 333 and 292 µs with two beds (two rounds, interleaved), the transparent pass unchanged within the noise (426 and 392 against 435 and 394): 12 to 30 µs for two beds. A host that never asks for a bed builds nothing: the colour table and the coal field (a 128 x 128 tile, about 40 ms in a release build) are made the first time a site has a `FuelBed`.
+
+## Seeing a whole fire (`Fire`)
+
+`examples/fires.rs` is one `Fire` on an empty entity and a one-light pool; `LIGHTS_KIND` names the kind, and the camera stands a fixed number of flame heights back so a candle and a bonfire fill the frame alike. `docs/media/fires.png` is six runs and a montage:
+
+```sh
+cd /path/to/bevy_lights
+for k in candle lantern torch brazier campfire bonfire; do
+  LIGHTS_FRAMES=240 LIGHTS_KIND=$k LIGHTS_SHOT=/tmp/$k.png cargo run --release --example fires
+done
+# six panels at 520 x 293 with the names under them, then an 8-bit PNG (16-bit is 2.7 MB; 128 colours bands the dark ground)
+magick montage -font DejaVu-Sans -pointsize 20 -fill white -background '#050810' -label '%t' \
+  /tmp/{candle,lantern,torch,brazier,campfire,bonfire}.png -tile 3x2 -geometry 520x293+3+3 /tmp/fires16.png
+magick /tmp/fires16.png -depth 8 -define png:compression-level=9 PNG24:docs/media/fires.png
+```
+
+Other switches: `LIGHTS_COLOUR=0.1,0.32,1.0` (linear) is a blue fire (light, flame, sparks and smoke in one hue), `LIGHTS_SMOKE=0`, `LIGHTS_EMBERS=0`, `LIGHTS_TONGUES=0` and `LIGHTS_BED=0` are the `Fire` flags, `LIGHTS_ROW=12` lays twelve side by side (a frame sequence shows them breathing apart: each has its own phase), and `LIGHTS_SNUFF=1.0 LIGHTS_COOLING=6 LIGHTS_KIND=campfire` puts the fire out and leaves its coals cooling, the light, the flame, the smoke's trail and the bed all following the one entity.
+
+What was checked, and how:
+
+- **The build before a `Fire` is the build after.** `examples/campfire.rs` wrote each fire's `PointLight`, `Flicker` and `FlameSite` by hand and is now one `Fire` per fire on a two-light pool (the template's colour dropped, since a `Fire` brings its own). Six still-air views of it (the default, `campfire` and `bonfire` close, from above, the tongue-less comparison, a fire put out) against the old binary at frame 240: **at most 2 DN** anywhere, 0.0017 to 0.017 DN mean, and a fire put out 1 DN over 3 039 pixels. The 2 DN is on the ground and was not isolated; the likely cause is the pool template's one range for both fires (27 m) where the hand-written campfire light had 15 m. **In a wind they differ** (`LIGHTS_WIND=1.5,0`: 430 040 pixels, mean 2.2 DN, max 237): the pooled light leans with its flame (`docs/research/flame-lean-light.md`) and the hand-written one did not, which is the intended difference, though it was not isolated either.
+- **A scene that does not use `Fire` is unchanged.** The default courtyard in eight views (default, ground, edge, top, graze, seed 3 with pools of 4 and 16, and the close camera with sparks and smoke, 300 frames, `magick compare`/numpy count) against the old binary: six zero pixels, edge one pixel and close two pixels off by 1 DN (the GPU's own noise).
+- **The first capture found a white pool.** `Fire { color: None }` first left the candidate's colour to the pool template, whose default is white, and the six kinds were orange flames over white ground. A `Fire` with no colour now throws a `FIRE_KELVIN` (1900 K) light; the unit test asserts it for every kind.
+- **Known limits.** The coals stay coal-coloured under a coloured flame (a green fire on orange coals): turn the bed off for a magic fire. A `Fire` is pooled: a host with no `LightPoolPlugin` gets the flame and a logged error, not a light.
+- **What it costs.** `BENCH_FIRE=1` against `BENCH_FIRE=2` (the same parts written by hand), 5 000 torches, 15 in view, four rounds interleaved, `p50_ms` 3.89 to 4.65 against 3.78 to 3.97 (and one by-hand outlier round at 7.87, min 3.96, on a loaded machine) and `min_ms` 2.82 to 3.11 against 2.79 to 3.01: the component's own cost is at most a tenth of a millisecond at 5 000 fires (about 0.02 µs a fire a frame, inside the noise), and the work a fire does (the linked flame, the sparks, the smoke) is the same either way. `bench_lights` base against new, three rounds, `min_us` 405, 404, 325 against 322, 335, 325, `p50_us` 687, 729, 509 against 558, 713, 542: the same (nothing it runs was touched); `bench_flames` with no `Fire` and with sparks and smoke, base against new, p50 2.47 to 3.28 against 2.40 to 3.96 and 4.30 to 6.16 against 4.68 to 6.12 over three rounds at load average 14: the same.
+
+## Seeing a fire that moves (`FlameMotion`)
+
+`examples/fires.rs` carries its fire with `LIGHTS_WALK=v` (metres per second along +X) for `LIGHTS_WALK_FOR=s` seconds (default 1.5), centred on where it was placed, and then stands it still; the camera stands back 3.5 m. A frame sequence shows the flame lie back while it is carried and stand up again after (`docs/media/carried.png` is six frames of it):
+
+```sh
+LIGHTS_FRAMES=190 LIGHTS_KIND=torch LIGHTS_WALK=1.4 LIGHTS_WALK_FOR=1.5 LIGHTS_EYE=0,0.65,3.2 LIGHTS_LOOK=0,0.3,0 \
+  LIGHTS_SHOT_DIR=$HOME/walk LIGHTS_SHOT_FROM=20 LIGHTS_SHOT_EVERY=10 ./target/release/examples/fires
+```
+
+Measured on those frames (the principal axis of the flame's bright, warm pixels against the vertical): 57° at frame 50 and 50° at frame 90 while carried at 1.4 m/s (`flame_tilt(1.4, 0.1)` is 54.7°), 20° a third of a second after the stop and under 10° from half a second on (the filter's 0.15 s is `exp(-t / 0.15)`: 0.15 m/s left at 0.33 s, which `flame_tilt` lays over 22°). On the courtyard `LIGHTS_MOTION=0` is the courtyard as it was before a fire's own motion counted, and it is **zero pixels different** from the build before in eight views (default, ground, edge, mid, top, graze, seed 3 with pools of 4 and 16, 300 frames each; one pixel off by 1 DN in two of them, the GPU's own noise): a fire that stands still, or a gain of zero, is the picture it was. With the gain at its default the braziers (which stand still) are unchanged and the walking torch-bearers' flames and the light and shadows they throw differ.
+
+**The hand-off is not disturbed by it**: 141 consecutive courtyard frames (`LIGHTS_SEED=3 LIGHTS_POOL=4 LIGHTS_FOCUS_WALK=18 LIGHTS_HYSTERESIS=1.0`, frames 100 to 240), each frame's mean red-green-blue departure from the average of its two neighbours, whole frame and each half: at most 0.20 DN with the lean and 0.19 before, 99th percentile 0.08 both (a pop is a DN or more).
+
+**What it costs** (CPU, interleaved against the build before it on a machine at load average 19-34): `bench_lights` (no `FlameSite`, so nothing it runs was touched) `min_us` 337-348 against 342-360 and `p50_us` 527-543 against 533-569 over three alternating runs each; `bench_flames` with 5 000 torches that stand still, `p50_ms` 2.38-2.55 against 2.30-2.50 (a fire at rest costs the tracker one position compare, about 0.02 µs a frame); with all 5 000 walking (`BENCH_MOVING=1.4`) the lean itself (`BENCH_MOTION=1` against `0`) costs up to 0.3 ms at 5 000 moving fires, about 0.06 µs a fire, in the noise of the load.
+
 ## The still
 
 ```sh
 LIGHTS_FRAMES=600 LIGHTS_SHOT=docs/media/courtyard.png cargo run --release --example courtyard
 ```
 
-`LIGHTS_EMBERS=r` gives every flame `r` sparks a second (`FlameEmbers`; unset, none). `LIGHTS_GPU_TIMING=1` with `LIGHTS_FRAMES=420` prints the mean GPU microseconds per render pass (`gpu_us <pass> <mean>`, frames 100 to 400; needs Vulkan or DX12 timestamp queries). `LIGHTS_EYE` and `LIGHTS_LOOK` move the camera (`x,y,z`). The default eye is `(0, 9, 16)` looking at
+`LIGHTS_EMBERS=r` gives every flame `r` sparks a second (`FlameEmbers`; unset, none). `LIGHTS_SMOKE=d` gives every flame `FlameSmoke { density: d }` (unset, none; `0.8` is the default density; add `LIGHTS_WIND=3,0` to see the column bend, and a close camera, `LIGHTS_EYE=2.4,1.5,7.2 LIGHTS_LOOK=5,1.6,5`, to see it: from the default 45° camera it is foreshortened to a thin wisp). `LIGHTS_GPU_TIMING=1` with `LIGHTS_FRAMES=420` prints the mean GPU microseconds per render pass (`gpu_us <pass> <mean>`, frames 100 to 400; needs Vulkan or DX12 timestamp queries). `LIGHTS_EYE` and `LIGHTS_LOOK` move the camera (`x,y,z`). The default eye is `(0, 9, 16)` looking at
 the origin; the GIF's angle is the default.
 
 ## The GIF
@@ -257,8 +442,8 @@ FPS=30 WIDTH=640 \
 sequence (frame 0 is black: the pipelines are still compiling), renumbered from 0 and encoded with `WIDTH=640`. 48 frames,
 3.2 MB. `docs/media/courtyard.png` is the still above. Both were re-taken on 2026-10-28 with the bowl braziers and the
 ember bed (the earlier files showed box braziers and a pink bed), and on 2026-10-30 with every figure casting a shadow,
-the pool's three shadowed lights and the 20 cd/m² sky fill; that capture, and the showcase and relight clips, used
-`LIGHTS_EMBERS=4`.
+the pool's three shadowed lights and the 20 cd/m² sky fill, and on 2026-10-31 with the torch-bearers' flames leaning behind them as they
+walk (`FlameMotion`); that capture, and the showcase and relight clips, used `LIGHTS_EMBERS=4`.
 
 **No default font path, deliberately.** `/System/Library/Fonts/...` exists on exactly one of the
 machines this repo is built on and fails on the others — and it fails in `magick`, after ffmpeg has

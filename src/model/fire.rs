@@ -201,6 +201,15 @@ pub const KINDLE_SECONDS: f32 = 0.6;
 /// [`Snuff`]: crate::Snuff
 pub const SNUFF_SECONDS: f32 = 1.2;
 
+/// How long the smoke of a fire that was put out goes on, in seconds: a [`FlameSmoke`] on a flame whose
+/// light has a [`Snuff`] lifts off the fire and thins over this long, after the flame itself is gone.
+/// Design default (`docs/research/flame-smoke-tail.md`): "the first few seconds" a wick goes on
+/// smoking, and long enough for the lifted base of the column to leave its top.
+///
+/// [`FlameSmoke`]: crate::FlameSmoke
+/// [`Snuff`]: crate::Snuff
+pub const SMOKE_TAIL_SECONDS: f32 = 5.0;
+
 /// The flicker multiplier of a fire light at time `t` seconds and clock `phase` radians: a sum of two
 /// sines mapped to 0.70..1.00 of the light's base intensity, mean 0.85.
 ///
@@ -284,6 +293,28 @@ pub fn flame_tilt(speed: f32, diameter: f32) -> f32 {
 /// The diameter [`flame_tilt`] assumes for a fire with none given, in metres: a torch head to a lantern's
 /// flame bed. Design default (`docs/research/flame-wind.md`).
 pub const DEFAULT_FIRE_DIAMETER: f32 = 0.2;
+
+/// A fire's own clock start, in radians in `[0, TAU)`, from any 64-bit seed (an entity's bits, a placement's
+/// id): the per-instance "animation start frame" that keeps twenty identical torches from breathing in unison
+/// (Nguyen, GPU Gems 1 ch. 6: particles "with a random percentage of difference for a number of attributes:
+/// size, position, rate of decay, animation start frame"). A SplitMix64 of the seed, so neighbouring seeds (an
+/// entity's index and the next) are uncorrelated, the same seed is the same phase on every machine, and a run
+/// that spawns in the same order is reproducible. Design default (`docs/research/fire-component.md`).
+///
+/// ```
+/// # use bevy_lights::model::fire::fire_phase;
+/// assert_eq!(fire_phase(7), fire_phase(7));
+/// assert_ne!(fire_phase(7), fire_phase(8));
+/// assert!((0.0..std::f32::consts::TAU).contains(&fire_phase(u64::MAX)));
+/// ```
+pub fn fire_phase(seed: u64) -> f32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // The top 24 bits are exactly representable in an f32; the clamp keeps the product strictly below `TAU`.
+    ((z >> 40) as f32 / (1u64 << 24) as f32 * TAU).min(f32::from_bits(TAU.to_bits() - 1))
+}
 
 /// Gravity, m/s².
 const GRAVITY: f32 = 9.81;
@@ -431,5 +462,36 @@ mod wind_tests {
             assert!(flame_tilt(2.0, diameter * 2.0) < flame_tilt(2.0, diameter));
         }
         assert!(flame_tilt(2.0, f32::NAN).is_finite());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod phase_tests {
+    use super::*;
+
+    #[test]
+    fn a_phase_is_a_point_of_the_circle_for_any_seed() {
+        for seed in (0..20_000u64).chain([u64::MAX, u64::MAX - 1, 1 << 63]) {
+            let phase = fire_phase(seed);
+            assert!((0.0..TAU).contains(&phase), "seed {seed}: {phase}");
+        }
+    }
+
+    #[test]
+    fn neighbouring_entities_do_not_breathe_together() {
+        // Entity bits run in steps of one: twenty fires spawned in a row must not land in one clump of the circle.
+        let mut buckets = [0u32; 8];
+        for seed in 0..800u64 {
+            buckets[(fire_phase(seed) / TAU * 8.0) as usize] += 1;
+        }
+        for (bucket, count) in buckets.iter().enumerate() {
+            assert!(
+                (60..=140).contains(count),
+                "bucket {bucket} holds {count} of 800 (a fair spread is 100)"
+            );
+        }
+        let adjacent_equal = (0..1000u64).filter(|s| fire_phase(*s) == fire_phase(s + 1)).count();
+        assert_eq!(adjacent_equal, 0);
     }
 }

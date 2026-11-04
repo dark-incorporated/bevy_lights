@@ -18,6 +18,8 @@ plainly that it is a design default.
   default sits well inside.
 - [`flame-silhouette.md`](flame-silhouette.md) — the flame's edges, the puff law that would shape them,
   and the per-flame diameter that blocks it.
+- [`flame-culling.md`](flame-culling.md) — a fire off the screen costs almost nothing: the box a billboard
+  needs, why the instance scale must be divided out of it, and what 20 000 flames cost before and after.
 - [`flame-kindle.md`](flame-kindle.md) — a lit flame must *grow* with the light it motivates, and the
   scale that was written but never drawn.
 - [`carried-fire.md`](carried-fire.md) — where a hand-held fire's light belongs, and the lumens it needs
@@ -28,6 +30,27 @@ plainly that it is a design default.
   fade, so a light that changes owner does not pop.
 - [`pool-template.md`](pool-template.md) — every setting of the pool's template on every pool light,
   live and saved; Bevy's soft-shadow and contact-shadow levers, measured.
+- [`pool-foci.md`](pool-foci.md) — the pool for more than one viewer: a shared budget with one focus per
+  viewer, why a plain nearest-focus distance starves the sparse viewer, and the light a moving camera
+  turns to.
+- [`fire-colour.md`](fire-colour.md) — a fire's own colour on its flame, its sparks and the pooled light
+  it is handed: one hue for the visible source and the light it throws, as the same ramp rotated.
+- [`flame-smoke.md`](flame-smoke.md) — the plume a fire goes on up as: one additive quad, a function of the
+  shared clock, lit by the flame and bent over in a wind (a bent-over plume, a turbulent plume's width).
+- [`flame-smoke-tail.md`](flame-smoke-tail.md) — what a fire that is put out leaves: smoke density is
+  advected, so the column's base lifts off the wick and thins for a few seconds instead of shrinking with the
+  flame.
+- [`flame-tongues.md`](flame-tongues.md) — a wide fire as several tongues: a campfire's or a bonfire's bed is
+  two to four times as wide as its one slender flame, so a site may carry `FlameTongues`, extra flames of
+  different heights and phases laid on a Vogel disc and capped by the merge height of group fires (`3 S`).
+- [`fuel-bed-heat.md`](fuel-bed-heat.md) — a bed of coals that lives with its fire (`FuelBed`): a tileable char field and a
+  temperature ramp whose three stops move with the bed's heat, so the coals breathe with the flicker, warm as the fire catches
+  and, when it is put out, go on glowing and cool over a minute instead of vanishing with the flame.
+- [`fire-component.md`](fire-component.md) — a whole fire as one component (`Fire`): a kind, a brightness and a colour become the
+  flame, its pooled light and the kind's sparks, smoke, tongues and bed, each fire on a clock of its own, what a host spawns
+  beside it winning and a change to it rewriting every part.
+- [`flame-motion.md`](flame-motion.md) — a fire that moves leans against its own motion: the flame's lean comes from the air relative to the
+  fire (the wind less the site's own smoothed ground velocity), so a carried torch streams behind its bearer, settles when they stop and takes its pooled light with it.
 - [`corpus.md`](corpus.md) — what the home-still library actually holds for cinematography,
   photography, CG and animation lighting, game-lighting craft, many-light rendering, fire physics and
   perception, with the stems to read and the gaps to fill.

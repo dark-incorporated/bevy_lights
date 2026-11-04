@@ -208,3 +208,82 @@ live from the running index, not from memory.
 
 Two `EmbedSkip` rows in the scan (`10.5463_thesis.122`, `10.54612_a.3e1a1pjirr`) failed on
 `gpu busy: 1842 MB free < 5000 MB required`; both are unrelated to lighting.
+
+## Added by the 2026-10-30 re-scan (iteration 276)
+
+`catalog_recent` (200 rows, 23:20-23:40 UTC) is a bulk import of a graphics and geometry-processing library plus unrelated
+books and papers. Read live from the running index. Nothing in it is cinematography, photography or fire physics; two groups
+are worth a row, the rest are listed so the next scan does not re-investigate them.
+
+| stem | what it is | use |
+|---|---|---|
+| `PBR3_01_Introduction` to `PBR3_15_Light_Transport_III_Bidirectional_Methods` (15 chapters; `PBR3_05` and `PBR3_12` are listed above) | *Physically Based Rendering* 3rd ed. | the radiometry and light-source references stay `PBR3_05` and `PBR3_12`; `PBR3_04_Primitives_and_Intersection_Acceleration` is the spatial-structure reference for any future candidate culling |
+| `Idiomatic Rust- Code like a Rustacean`, `Effective Rust- 35 Specific Ways to Improve Your Rust Code` | Rust idiom books (Anna's Archive imports) | not lighting; the reference for per-frame code that must not allocate or scan |
+| `Evaluation-of-Reverse-Tone-Mapping-through-Varying-Exposure-Conditions` | already listed under *Perception and tone* | re-embedded, unchanged |
+| the mesh, garment, motion-synthesis, retargeting and parameterization papers (`Laplacian-*`, `Instant-Field-Aligned-Meshes`, `Neural-Cages-*`, `MoDi-*`, `Frame-Fields-*`, `Cosserat-Rods-*` and their `_supp` files), the medical, psychology and relationship books and papers (`NEJM200009073431002`, `Fight Right-*`, `Legion A Novel*`) | geometry processing, animation, health | **not lighting** |
+
+## Added by the 2026-10-30 re-scan (iteration 278)
+
+`catalog_recent` (200 rows, 02:04-02:22 UTC on the 31st) is a re-embedding of the SIGGRAPH library (`sig2024_*`, `sig2026_*`, the `s2006`-`s2025` *Advances* courses) plus unrelated books and papers. Read from the on-disk markdown, not from memory. Nothing in it is cinematography, photography or practical-fire craft; the rows that bear on this crate are below, the rest is listed so the next scan does not re-investigate it.
+
+| stem | what it is | use |
+|---|---|---|
+| `s2024-advances-pdf-2-6-mb` | *Seamless cluster rendering on mobile* (SIGGRAPH 2024 *Advances*) | clustered lights on a mobile budget: how many real lights a shipping renderer affords, for `LightPool`'s default sizes |
+| `s2024-advances-pdf-48-mb` | *Hemispherical lighting insights* (SIGGRAPH 2024 *Advances*) | least-squares and spherical-harmonic encodings of irradiance: the technical reference when a practical's wash on a floor is compared with a probe's |
+| `s2024-advances-pdf-7-mb` | Frostbite GIBS (SIGGRAPH 2024 *Advances*) | global illumination a game's lights are added to; context for the pool's bounce-free fill |
+| `sig2024_Area_ReSTIR_Resampling_for_Real-Time_Defocus_and_Antialiasing`, `sig2026_Spatio-Temporal_Control_Variates_with_ReSTIR_for_Real-Time_Rendering` | resampled many-light direct illumination | the technical alternative to a budgeted pool (every light, sampled), as `s2025-advances-materials-9` and `-12` are |
+| `sig2024_Scintilla_Simulating_Combustible_Vegetation_for_Wildfires` | fire spreading through vegetation | forest-fire spread is `bevy_flora`'s, not this crate's (`AGENTS.md`, ownership map); listed so it is not re-read |
+| `s2024-advances-pdf-slides-notes-6mb` (Iwanicki, Activision), `s2024-advances-pdf-slides-notes-5mb`, `s2024-advances-pdf-12-5-mb`, `s2017-advances-pdf-slides-*` (clouds, planar reflections), the rest of `s2006`-`s2025-advances-*` | neural-network, terrain, cloud and reflection talks | **not lighting** (`torch` in the Iwanicki talk is PyTorch) |
+| the `sig2024_*` and `sig2026_*` geometry, simulation, diffusion, cloth, knit, differentiable-rendering and optimisation papers; `transvoxel_*`, `tetgen_*`, `vowels2021`, `thompson2020`, the `schoeller_*` papers, `sexes-05-00047`, `slatkin_effective_python_3rd` | geometry processing, ML, medical and psychology | **not lighting** |
+
+Three `EmbedSkip` rows (`ssrn_1601785`, `sm2_58`, `slatkin_effective_python_3rd`) failed on `503 ... myelin observe` and are unrelated to lighting.
+
+## Added by the 2026-10-31 re-scan (iteration 279)
+
+`catalog_recent` (200 rows, newest 05:01 UTC on the 31st) is the same bulk re-embedding of the SIGGRAPH library that iteration 278 scanned (`sig2024_*`, `sig2026_*`, the `s2007`-`s2025` *Advances* courses), plus three `EmbedSkip` rows that failed on `gpu busy: 1012 MB free < 5000 MB required` and an unrelated forestry paper. Every stem was already on disk. Nothing in it is cinematography, photography or fire physics. Two stems that bear on this crate were not listed before:
+
+| stem | what it is | use |
+|---|---|---|
+| `s2008-advances-chapter-1` | Chen & Liu (Bungie), *Lighting and Material of Halo 3* (SIGGRAPH 2008 *Advances*) | a shipped game's lighting rig and its material model: production context for how a studio budgets the lights a scene carries |
+| `s2025-advances-materials` (the opening, lines 850-920) | Tatarchuk, *Advances in Real-Time Rendering in Games, celebrating 20 years*: the list of games that shaped the field | names *It Takes Two* ("narrative co-operative gameplay with forced split screen") and *Split Fiction* ("expanded upon the forced split-screen co-op model"): evidence that a pool with one focus is not every shipped game's camera |
+
+`book_real_time_rendering_4th_akenine` chapter 21 (virtual and augmented reality) is the technical reference for a frame drawn from more than one viewpoint at once ("each eye has a separate display"). The corpus has no document on lighting a scene for several cameras at once (searched: split-screen, multi-camera, per-view, local multiplayer); the craft source for that is on the web and is listed under `docs/research/pool-foci.md`'s `Pending index`.
+
+## Added by the 2026-10-31 re-scan (iteration 281)
+
+`catalog_recent` (200 rows, newest 07:21 UTC) is the same SIGGRAPH re-embedding iterations 278-280 scanned, plus unrelated clinical-psychology and software papers and the two candle-flame papers (`10.1038_s41598-018-36754-w`, Chen et al. 2019, *Frequency and phase characteristics of candle flame oscillation*; `10.1038_s41598-020-78229-x`, *Flickering candle flames and their collective behavior*), which are in the library and indexed but not yet in the on-disk corpus. They bear on the flicker's rate and phase, not on a new system. No `Research: corpus` commit beyond this note. Smoke (`flame-smoke.md`) read four stems that were already on disk and were not listed for it:
+
+| stem | what it is | use |
+|---|---|---|
+| `s2011-advances-pdf-slides` (Fire/Flamethrowers/Thrusters, lines 1290-1462) | SIGGRAPH 2011 *Advances*, shipping fire | "Particle comp pass converts hotness to a blackbody color texture, adds it on top of smokey particles renderered with usual alpha blending": the additive heat layer over a smoke layer |
+| `s2025-advances-materials-2` (lines 2333-2385) | SIGGRAPH 2025 *Advances*, the transparency (OIT) talk | why blended VFX smoke sorts badly: "manual sorting can result in a lot of side effects ... smoke tendrils look buggy" |
+| `PBR3_11_Volume_Scattering` | *Physically Based Rendering* 3rd ed., ch. 11 | "fog and smoke attenuate and scatter light": smoke is lit by the light that reaches it |
+| `10.13140_marples.nav.lighting.thesis` (9.5.3, lines 6152 and 8060-8206) | Marples 2017 (already listed above for navigation) | a torch sconce "with an animated flame and smoke effect" against a static glowing torch: a measured preference for the animated one (χ²(1, N = 76) = 19.000) |
+
+Not in the corpus: Morton, Taylor & Turner 1956 on plumes (cited second-hand through `10.5194/npg-21-269-2014`, Matulka et al. 2014, found with `paper_search`; `paper_download` and `distill_index` pending) and Briggs' bent-over plume rise law (textbook, no source on disk).
+
+## Added by the 2026-10-31 re-scan (iteration 283)
+
+`catalog_recent` (200 rows, newest 09:07 UTC) is psychology re-embeds, the SIGGRAPH re-embed iterations 278-282 scanned and Matulka's plume paper (already listed): no new lighting stem. The wide-fire note found one source in the catalog by a semantic search (`distill_search`), not in the local mirror:
+
+| stem | what it is | use |
+|---|---|---|
+| `10.3210_fst.26.1` | Delichatsios 2007, *A Correlation for the Flame Height in "Group" Fires* (Fire Sci. Technol. 26, 1) | flames of burners `S` apart merge above `Z_m = 3 S` (eqs. 6b and 7b, "L_f / S = 3 - 3.3"): the clamp on a side tongue's height in `docs/research/flame-tongues.md` |
+| `10.13140_marples.nav.lighting.thesis` (lines 3426-3440) | Marples 2017 (already listed) | "the motion of flame, this can be in the form of lanterns, flaming barrels, or burning objects" draws the player's gaze: a flame is looked at |
+| GPU Gems 1, ch. 6.2 (`GP/GPU Gems- Programming Techniques ...md`, lines 2925-2935) | Nguyen, *Fire in the "Vulcan" Demo* | "We started with a single animation, and it worked even better with two or more", a random difference in "size, position, rate of decay, animation start frame": a fire is several flames that differ |
+
+## Added by the 2026-10-31 re-scan (iteration 284)
+
+`catalog_recent` (200 rows, newest 10:33 UTC) is clinical-psychology and software re-embeds, the SIGGRAPH re-embed iterations 278-283 scanned, and the two candle-flame papers (`10.1038_s41598-018-36754-w`, `10.1038_s41598-020-78229-x`) iteration 283 already listed as in the library and bearing on the flicker's rate: no new lighting stem. The fuel-bed note read these from the on-disk corpus (not new, listed here because none was in the table for this system):
+
+| stem | what it is | use |
+|---|---|---|
+| `s2/s2011-advances-pdf-slides.md` (lines 1425-1435) | SIGGRAPH 2011 *Advances*, the fire talk | "hot objects splat their shape into the light volume textures to create local 'glow' lights", and "was quite difficult to hide the 'particle' nature of the system": a fire's hot surface is a light of its own that carries the fire's state |
+| `si/sig2024_Scintilla_Simulating_Combustible_Vegetation_for_Wildfires.md` (line 687) | Scintilla, SIGGRAPH 2024, Sec. 5.7 | "according to Stefan-Boltzmann and Newton cooling laws, we estimated the ember temperature change": the cooling law of a glowing coal after its flame is out, exponential in the excess temperature |
+| `10/10.32657_10220_48312.md` (line 1145) | Doyle's colour and lighting design (already listed) | "Doyle uses diegetic colour that originates within the narrative to provide motivation for the incandescent spot": the glow must have a source in the frame |
+
+Not in the corpus: Rein 2009, *Smouldering Combustion Phenomena in Science and Technology* (IRECHE 1; found by `paper_search`, no DOI, `hdl.handle.net/1842/2678`, so `paper_download` cannot take it): the length of a real bed's glow after its flame is out. `docs/research/fuel-bed-heat.md` lists it under `Pending index`. The corpus has no source on coal-bed cooling times; the default `FuelBed::cooling` is a design default for that reason.
+
+## The 2026-10-31 re-scan (iteration 285)
+
+`catalog_recent` (200 rows, newest 11:32 UTC) is clinical-psychology re-embeds, the SIGGRAPH 2017-2025 *Advances* and 2024 papers re-embed iterations 278-284 scanned, and Matulka's plume paper and the two candle-flame papers already listed: no new lighting stem, so no `Research: corpus` commit. `fire-component.md` rests on stems already listed (Marples, GPU Gems 1 ch. 6.2, Chen et al.) and on Bevy's own vendored `Required Components` documentation.

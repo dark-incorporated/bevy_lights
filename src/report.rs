@@ -34,11 +34,16 @@ checked!(
     crate::Snuff,
     crate::FlameSite,
     crate::FlameEmbers,
+    crate::FlameSmoke,
+    crate::FlameTongues,
+    crate::FuelBed,
     crate::PoolCandidate,
+    crate::Fire,
     crate::LightPool,
     crate::FlameLook,
     crate::FlameWind,
     crate::FlameGust,
+    crate::FlameMotion,
 );
 
 /// Warns about the first bad `C` this observer sees, then stays quiet: a scene of a thousand identical

@@ -11,6 +11,7 @@ fn the_defaults_and_a_sane_fire_have_no_problems() {
     assert!(Flicker { base: 800.0, ..Default::default() }.problems().is_empty());
     assert!(Flicker::at_mean(1000.0, WHIPPING_FLICKER_DEPTH).problems().is_empty());
     let site = FlameSite {
+        color: None,
         height: 1.0,
         phase: 0.0,
         kindle: 0.0,
@@ -34,6 +35,7 @@ fn a_flicker_names_every_bad_field() {
 #[test]
 fn a_flame_site_and_look_report_their_own_fields() {
     let site = FlameSite {
+        color: None,
         height: 0.0,
         phase: 0.0,
         kindle: -2.0,
@@ -74,6 +76,7 @@ fn a_pool_candidate_and_a_kindle_report_their_bad_fields() {
     assert!(PoolCandidate::default().problems().is_empty());
     assert!(PoolCandidate::at_mean(900.0, 0.3).problems().is_empty());
     let bad = PoolCandidate {
+        color: None,
         offset: bevy::math::Vec3::new(0.0, f32::NAN, f32::INFINITY),
         intensity: -1.0,
         phase: Some(f32::NAN),
@@ -154,13 +157,30 @@ fn fire_kinds_shed_embers_by_size() {
     }
 }
 
-/// The bundle is the flame and its light together, so nothing a picker spawns can disagree with the kind.
+/// Smoke follows the fuel: a lantern's enclosed wick gives none, a candle a thin wisp, and a pitch or wood fire a thicker column than a
+/// clean one; every density is one the shader accepts.
 #[test]
-fn a_fire_bundle_is_the_flame_and_the_light_of_one_kind() {
+fn fire_kinds_smoke_by_what_they_burn() {
+    assert_eq!(FireKind::Lantern.smoke(), None);
+    let density = |kind: FireKind| kind.smoke().map(|smoke| smoke.density);
     for kind in FireKind::ALL {
-        let (site, candidate) = kind.fire(40.0, 1.8);
-        assert_eq!(site, kind.site(), "{}", kind.name());
-        assert_eq!(candidate, kind.candidate(40.0, 1.8), "{}", kind.name());
+        if let Some(smoke) = kind.smoke() {
+            assert!(smoke.problems().is_empty(), "{}", kind.name());
+        }
+    }
+    assert!(
+        density(FireKind::Candle) < density(FireKind::Brazier),
+        "a candle is a wisp beside a charcoal brazier"
+    );
+    assert!(density(FireKind::Brazier) < density(FireKind::Torch), "charcoal smokes less than a pitch torch");
+    assert!(density(FireKind::Torch) <= density(FireKind::Bonfire), "a bonfire is the heaviest");
+}
+
+/// A kind's flame and its light agree on the fire's size and depth, so nothing a picker spawns can disagree with the kind.
+#[test]
+fn a_kinds_flame_and_light_agree_on_its_diameter_and_depth() {
+    for kind in FireKind::ALL {
+        let (site, candidate) = (kind.site(), kind.candidate(40.0, 1.8));
         assert_eq!(
             (candidate.diameter, candidate.depth),
             (site.diameter, Some(site.depth)),
@@ -299,4 +319,28 @@ fn a_fire_kind_parses_the_name_it_displays() {
     assert_eq!(err, UnknownFireKind("pyre".into()));
     let msg = err.to_string();
     assert!(FireKind::ALL.iter().all(|k| msg.contains(k.name())), "{msg}");
+}
+
+/// A fire's own colour is saved with the fire and reads back; a file written before the field existed has none and
+/// loads as the scene's colour.
+#[cfg(feature = "serde")]
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_fires_colour_round_trips_and_an_old_save_loads_without_one() {
+    use bevy::prelude::Color;
+    let blue = Color::srgb(0.1, 0.3, 1.0);
+    let site = FlameSite { color: Some(blue), ..FireKind::Brazier.site() };
+    let back: FlameSite = serde_json::from_str(&serde_json::to_string(&site).unwrap()).unwrap();
+    assert_eq!(back, site);
+    let candidate = PoolCandidate { color: Some(blue), ..PoolCandidate::at_mean(500.0, 0.15) };
+    let back: PoolCandidate = serde_json::from_str(&serde_json::to_string(&candidate).unwrap()).unwrap();
+    assert_eq!(back, candidate);
+
+    let mut old: serde_json::Value = serde_json::to_value(FireKind::Brazier.site()).unwrap();
+    old.as_object_mut().unwrap().remove("color");
+    let loaded: FlameSite = serde_json::from_value(old).unwrap();
+    assert_eq!(loaded.color, None);
+    let mut old: serde_json::Value = serde_json::to_value(PoolCandidate::default()).unwrap();
+    old.as_object_mut().unwrap().remove("color");
+    assert_eq!(serde_json::from_value::<PoolCandidate>(old).unwrap().color, None);
 }

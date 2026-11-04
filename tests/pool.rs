@@ -363,6 +363,75 @@ fn the_shadow_budget_goes_to_the_best_ranked_lights() {
     assert!(app.world().resource::<PoolBudget>().shadowed.is_empty());
 }
 
+/// The visible reserve lights (slot at or past the pool's size), by `(casts a shadow, flicker base)`.
+fn reserves_at(app: &mut App, size: usize) -> Vec<(bool, f32)> {
+    lights(app)
+        .into_iter()
+        .filter(|(slot, _, visibility, ..)| *slot >= size && *visibility != Visibility::Hidden)
+        .map(|(_, _, _, base, shadow)| (shadow, base))
+        .collect()
+}
+
+#[test]
+fn turning_the_pools_shadows_off_reaches_the_reserves_too() {
+    // Pool of one, cap one, one reserve. The torch leaves and the reserve fades its shadowed light out;
+    // while it does, the player turns shadows off, by the template's flag or by a cap of nothing. The
+    // settings say no pool light casts, so none may, the reserve's included, though its light fades on.
+    for turn_off in [
+        (|pool: &mut LightPool| pool.light.shadow_maps_enabled = false) as fn(&mut LightPool),
+        |pool: &mut LightPool| pool.max_shadowed = Some(0),
+    ] {
+        let mut app = app(shadowed_pool(1, 1, 1));
+        focus_at(&mut app, Vec3::ZERO);
+        let near = candidate(&mut app, Vec3::new(1.0, 0.0, 0.0), 100.0);
+        settle(&mut app);
+        assert_eq!(shadowed_at(&mut app).len(), 1);
+        app.world_mut().entity_mut(near).insert(Visibility::Hidden);
+        app.update();
+        assert_eq!(
+            reserves_at(&mut app, 1).iter().filter(|(shadow, _)| *shadow).count(),
+            1,
+            "fixture: a reserve carries the shadow: {:?}",
+            lights(&mut app)
+        );
+        turn_off(&mut app.world_mut().resource_mut::<LightPool>());
+        app.update();
+        assert!(shadowed_at(&mut app).is_empty(), "shadows off, yet a light casts: {:?}", lights(&mut app));
+        let carrying = reserves_at(&mut app, 1);
+        assert!(
+            carrying.len() == 1 && carrying[0].1 > 0.0,
+            "the reserve still fades its light out, unshadowed: {:?}",
+            lights(&mut app)
+        );
+        // And it stays off for the whole of the fade.
+        for frame in 0..30 {
+            app.update();
+            assert!(shadowed_at(&mut app).is_empty(), "frame {frame}: {:?}", lights(&mut app));
+        }
+    }
+}
+
+#[test]
+fn a_departure_on_the_frame_shadows_go_off_starts_unshadowed() {
+    // The reserve's light is copied from last frame's look, which was shadowed. The frame the shadows go
+    // off it must not start casting from that copy.
+    let mut app = app(shadowed_pool(1, 1, 1));
+    focus_at(&mut app, Vec3::ZERO);
+    let near = candidate(&mut app, Vec3::new(1.0, 0.0, 0.0), 100.0);
+    settle(&mut app);
+    assert_eq!(shadowed_at(&mut app).len(), 1);
+    app.world_mut().entity_mut(near).insert(Visibility::Hidden);
+    app.world_mut().resource_mut::<LightPool>().light.shadow_maps_enabled = false;
+    app.update();
+    let carrying = reserves_at(&mut app, 1);
+    assert!(
+        carrying.len() == 1 && carrying[0].1 > 0.0,
+        "fixture: the departing light fades out: {:?}",
+        lights(&mut app)
+    );
+    assert!(shadowed_at(&mut app).is_empty(), "a reserve started a shadow: {:?}", lights(&mut app));
+}
+
 #[test]
 fn a_light_that_earns_a_shadow_gains_it_by_a_cross_fade() {
     // One shadow, on the nearer of two torches. The nearer goes out, and the other earns the shadow
@@ -1131,7 +1200,7 @@ fn the_budget_is_flagged_changed_only_when_the_schedule_changes() {
 mod saved_pool {
     use bevy::light::PointLight;
     use bevy::prelude::*;
-    use bevy_lights::{LightPool, Rank};
+    use bevy_lights::{FocusRule, LightPool, Rank};
 
     #[test]
     fn a_pool_round_trips_with_its_slot_template() {
@@ -1148,6 +1217,7 @@ mod saved_pool {
                 ..default()
             },
             rank: Rank::Distance,
+            focus: FocusRule::Shared,
             hysteresis: 1.3,
             fade_seconds: 0.0,
             reserve: 3,
@@ -1156,6 +1226,7 @@ mod saved_pool {
         let json = serde_json::to_string(&pool).unwrap();
         let back: LightPool = serde_json::from_str(&json).unwrap();
         assert_eq!((back.size, back.reach, back.gain, back.rank), (6, 31.5, 0.4, Rank::Distance));
+        assert_eq!(back.focus, FocusRule::Shared, "the focus rule is saved");
         assert_eq!((back.hysteresis, back.fade_seconds, back.reserve), (1.3, 0.0, 3));
         assert_eq!(back.max_shadowed, Some(3), "the shadow budget is saved");
         assert_eq!(back.light.color, pool.light.color);
@@ -1213,6 +1284,11 @@ mod saved_pool {
         assert_eq!(pool.light.range, 12.0);
         assert_eq!(pool.light.color, defaults.light.color);
         assert_eq!((pool.reach, pool.reserve, pool.rank), (defaults.reach, defaults.reserve, defaults.rank));
+        assert_eq!(
+            pool.focus,
+            FocusRule::One,
+            "a file saved before the focus rule existed serves one viewer"
+        );
     }
 }
 
@@ -1274,6 +1350,51 @@ fn a_pooled_fire_that_is_snuffed_dims_its_light_to_nothing_and_frees_the_slot() 
     assert_eq!(app.world().resource::<Heard>().out, 1);
 }
 
+/// A scene saved with its torches out loads each with a finished `Snuff`: a town at dawn is thousands of them,
+/// and the pool meets every one every frame. A finished `Snuff` is a fire that is out, so it holds no light and
+/// is not announced again; one still in progress holds a dimmed light; and a fire that was never snuffed holds a
+/// full one.
+#[test]
+fn fires_loaded_already_out_hold_no_light_and_one_loaded_mid_snuff_holds_a_dim_one() {
+    let mut app = app(LightPool { size: 3, reserve: 0, reach: 30.0, gain: 1.0, ..default() });
+    listen(&mut app);
+    focus_at(&mut app, Vec3::ZERO);
+    let out: Vec<Entity> = (1..=4)
+        .map(|near| {
+            let fire = candidate(&mut app, Vec3::new(near as f32, 0.0, 0.0), 1000.0);
+            app.world_mut().entity_mut(fire).insert(Snuff { elapsed: SNUFF_SECONDS });
+            fire
+        })
+        .collect();
+    let dying = candidate(&mut app, Vec3::new(6.0, 0.0, 0.0), 1000.0);
+    app.world_mut().entity_mut(dying).insert(Snuff { elapsed: SNUFF_SECONDS / 2.0 });
+    let burning = candidate(&mut app, Vec3::new(9.0, 0.0, 0.0), 1000.0);
+    settle(&mut app);
+
+    let budget = app.world().resource::<PoolBudget>();
+    let holders: Vec<Option<Entity>> = (0..3).map(|slot| budget.holder_of(slot)).collect();
+    assert!(
+        holders.iter().flatten().all(|held| !out.contains(held)),
+        "a fire that is out holds a light: {holders:?}"
+    );
+    assert!(holders.contains(&Some(dying)) && holders.contains(&Some(burning)), "{holders:?}");
+    assert_eq!(holders.iter().flatten().count(), 2, "the third light has nobody to light: {holders:?}");
+    assert_eq!(budget.wanting, 2, "four fires that are out want nothing");
+
+    let base_of = |app: &mut App, fire: Entity| {
+        let slot = (0..3).find(|slot| app.world().resource::<PoolBudget>().holder_of(*slot) == Some(fire));
+        slot.map(|slot| assigned(app, 3)[slot].3)
+    };
+    let burning_base = base_of(&mut app, burning);
+    let dying_base = base_of(&mut app, dying);
+    assert_eq!(burning_base, Some(1000.0), "a fire that was never snuffed is at full");
+    assert!(
+        dying_base.is_some_and(|base| 0.0 < base && base < 1000.0),
+        "a fire loaded half way out is dim, not out and not full: {dying_base:?}"
+    );
+    assert_eq!(app.world().resource::<Heard>().out, 0, "a fire loaded out is not announced");
+}
+
 #[test]
 fn a_pooled_fire_that_is_kindled_lends_a_light_that_flares_up_and_is_heard_once() {
     let mut app = app(LightPool { size: 1, reserve: 0, reach: 30.0, gain: 1.0, ..default() });
@@ -1308,6 +1429,7 @@ fn a_pooled_light_follows_its_flames_lean() {
         .world_mut()
         .spawn((
             FlameSite {
+                color: None,
                 height: 1.0,
                 phase: 0.0,
                 kindle: 0.0,
@@ -1343,6 +1465,50 @@ fn a_pooled_light_follows_its_flames_lean() {
     assert!((by(&mut app, bare) - Vec3::new(0.0, 2.0, -1.0)).length() < 1e-4, "no flame, no lean");
 }
 
+/// A torch carried through still air has a wind of its own: its light stands in the flame that streams behind it, by the
+/// tilt of its pace (`FlameVelocity` is what the flame plugin writes from the site's motion), and with the gain at zero it
+/// stands upright, as it did before the fire's own motion counted.
+#[test]
+fn a_pooled_light_follows_the_lean_of_a_carried_flame() {
+    let mut app = app(LightPool { size: 3, ..default() });
+    let torch = app
+        .world_mut()
+        .spawn((
+            FlameSite {
+                color: None,
+                height: 1.0,
+                phase: 0.0,
+                kindle: 0.0,
+                diameter: Some(0.1),
+                depth: 0.15,
+                depth_fade: false,
+                fire: None,
+            },
+            PoolCandidate { offset: Vec3::Y * 0.5, intensity: 1000.0, ..default() },
+            Transform::from_xyz(0.0, 0.0, 1.0),
+        ))
+        .id();
+    focus_at(&mut app, Vec3::ZERO);
+    settle(&mut app);
+    let light = |app: &mut App| -> Vec3 {
+        slots(app).into_iter().find(|slot| slot.3 > 0.0).map(|slot| slot.1).expect("the torch's light")
+    };
+    let still = light(&mut app);
+    assert!((still - Vec3::new(0.0, 0.5, 1.0)).length() < 1e-4, "standing: {still:?}");
+
+    app.world_mut().get_mut::<FlameVelocity>(torch).expect("a site carries its velocity").ground =
+        Vec2::new(0.0, 1.4);
+    settle(&mut app);
+    let walking = light(&mut app);
+    let want = Vec3::from(lean_light_shift(1.0, 1.4, 0.1, [0.0, -1.0]));
+    assert!(walking.z < still.z - 0.2 && walking.y < 0.5, "behind the bearer and lower: {walking:?}");
+    assert!((walking - (still + want)).length() < 1e-4, "{walking:?} vs {still:?} + {want:?}");
+
+    app.insert_resource(FlameMotion { gain: 0.0, ..default() });
+    settle(&mut app);
+    assert!((light(&mut app) - still).length() < 1e-4, "gain 0: the light stands upright as it always did");
+}
+
 /// A torch whose light is a sibling of its flame (joined by `FlameSite::fire`) leans its light exactly as a
 /// light on the site entity does; a light no site names stays upright.
 #[test]
@@ -1358,6 +1524,7 @@ fn a_pooled_light_linked_by_a_site_follows_the_lean() {
         .id();
     app.world_mut().spawn((
         FlameSite {
+            color: None,
             height: 1.0,
             phase: 0.0,
             kindle: 0.0,
@@ -1381,4 +1548,515 @@ fn a_pooled_light_linked_by_a_site_follows_the_lean() {
     assert!((moved - want).length() < 1e-4, "{moved:?} vs {want:?}");
     let _ = bare;
     assert!((at(&mut app, -1.0) - Vec3::new(0.0, 2.0, -1.0)).length() < 1e-4, "no site, no lean");
+}
+
+/// A flame site on a torch one metre tall: the light is carried at the flame's middle, half a metre up.
+fn torch_site() -> FlameSite {
+    FlameSite {
+        color: None,
+        height: 1.0,
+        phase: 0.0,
+        kindle: 0.0,
+        diameter: None,
+        depth: 0.15,
+        depth_fade: false,
+        fire: None,
+    }
+}
+
+/// A shadow cross-fade of a light that keeps its owner holds the lit ground still — and under wind the
+/// ground the light lights is the leaned flame's, so both ends of the fade stand in the leaned flame. The
+/// departing reserve took last frame's un-leaned position and kept it, half a metre upwind of the flame.
+#[test]
+fn a_shadow_cross_fade_under_wind_keeps_both_ends_in_the_leaned_flame() {
+    let mut app = app(shadowed_pool(2, 1, 2));
+    app.insert_resource(FlameWind { velocity: Vec2::new(3.0, 0.0) });
+    focus_at(&mut app, Vec3::ZERO);
+    let torch = |x: f32| {
+        (
+            torch_site(),
+            PoolCandidate { offset: Vec3::Y * 0.5, intensity: 100.0, ..default() },
+            Transform::from_xyz(x, 0.0, 0.0),
+        )
+    };
+    let near = app.world_mut().spawn(torch(1.0)).id();
+    app.world_mut().spawn(torch(3.0));
+    settle(&mut app);
+    app.world_mut().entity_mut(near).insert(Visibility::Hidden);
+    let lean = Vec3::from(lean_light_shift(1.0, 3.0, DEFAULT_FIRE_DIAMETER, [1.0, 0.0]));
+    let at = Vec3::new(3.0, 0.5, 0.0) + lean;
+    for frame in 0..26 {
+        app.update();
+        let now = lights(&mut app);
+        let total = total_at(&now, at);
+        assert!((total - 100.0).abs() < 1e-3, "frame {frame}: {total} at the leaned flame: {now:?}");
+        if frame == 0 {
+            // The ordinary hand-off under wind: the torch that went out fades out in its own leaned flame,
+            // where its light stood, and does not jump back to the upright axis.
+            let gone = total_at(&now, Vec3::new(1.0, 0.5, 0.0) + lean);
+            assert!(gone > 99.0, "the departing torch left its leaned flame: {gone} ({now:?})");
+        }
+    }
+}
+
+/// The same cross-fade on a torch-bearer who keeps walking: the slot follows the bearer, and so must the
+/// reserve carrying the other end, or a light 2.4 m/s fast is split in two for the whole fade.
+#[test]
+fn a_shadow_cross_fade_of_a_walking_light_keeps_both_ends_on_it() {
+    let mut app = app(shadowed_pool(2, 1, 2));
+    focus_at(&mut app, Vec3::ZERO);
+    let near = candidate(&mut app, Vec3::new(1.0, 0.0, 0.0), 100.0);
+    let walker = candidate(&mut app, Vec3::new(3.0, 0.0, 0.0), 100.0);
+    settle(&mut app);
+    app.world_mut().entity_mut(near).insert(Visibility::Hidden);
+    for frame in 0..26 {
+        let at = Vec3::new(3.0 + 0.05 * frame as f32, 2.0, 0.0);
+        move_candidate(&mut app, walker, at - Vec3::Y * 2.0);
+        app.update();
+        let now = lights(&mut app);
+        let total = total_at(&now, at);
+        assert!((total - 100.0).abs() < 1e-3, "frame {frame}: {total} at the walker's light {at:?}: {now:?}");
+    }
+}
+
+/// The light a displaced owner leaves fades out where the owner is, not where it was when the hand-off was
+/// made: the pool's own doc says it "keeps moving ... exactly as the one that left did". Once the owner is
+/// gone from the pool (hidden here), the light holds the last place it followed it to.
+#[test]
+fn a_departing_light_follows_its_displaced_owner_and_holds_where_it_left_the_pool() {
+    let mut app = app(LightPool { size: 1, reserve: 1, reach: 100.0, gain: 1.0, ..default() });
+    focus_at(&mut app, Vec3::ZERO);
+    let walker = candidate(&mut app, Vec3::new(2.0, 0.0, 0.0), 100.0);
+    settle(&mut app);
+    // A nearer torch takes the light; the walker is displaced and keeps walking away.
+    candidate(&mut app, Vec3::new(0.5, 0.0, 0.0), 100.0);
+    let departing = |app: &mut App| -> Vec3 {
+        let found = lights(app);
+        let reserve = found.iter().find(|light| light.0 >= 1).copied().expect("a reserve light");
+        assert!(reserve.2 != Visibility::Hidden, "the reserve fades the walker out: {found:?}");
+        reserve.1
+    };
+    for frame in 1..=12 {
+        let at = Vec3::new(2.0 + 0.1 * frame as f32, 0.0, 0.0);
+        move_candidate(&mut app, walker, at);
+        app.update();
+        let at = departing(&mut app);
+        assert!(
+            (at - Vec3::new(2.0 + 0.1 * frame as f32, 2.0, 0.0)).length() < 1e-4,
+            "frame {frame}: {at:?}"
+        );
+    }
+    let last = departing(&mut app);
+    app.world_mut().entity_mut(walker).insert(Visibility::Hidden);
+    for frame in 0..4 {
+        app.update();
+        let at = departing(&mut app);
+        assert!((at - last).length() < 1e-4, "frame {frame} after it left: {at:?} vs {last:?}");
+    }
+}
+
+/// A `FireKind`'s bundle is a flame and the light that motivates it, spawned on one entity at the flame's
+/// foot. The light belongs in the flame, at `flame_light_offset(height)`: upright in still air, and where
+/// the leaned flame's middle is in a wind. With `offset` at zero the pool put it at the foot, and the lean
+/// (the move of the flame's *middle*) then sank it `height / 2` straight below the flame, under the coal bed.
+#[test]
+fn a_fire_kinds_pooled_light_stands_in_its_flame_and_leans_with_it() {
+    for kind in FireKind::ALL {
+        let mut app = app(LightPool { size: 1, reach: 100.0, gain: 1.0, ..default() });
+        app.insert_resource(FlameWind::default());
+        let foot = Vec3::new(2.0, 0.0, -3.0);
+        app.world_mut().spawn((kind.site(), kind.candidate(40.0, 1.0), Transform::from_translation(foot)));
+        focus_at(&mut app, Vec3::ZERO);
+        settle(&mut app);
+        let half = kind.height() * 0.5;
+        let still = assigned(&mut app, 1)[0].1;
+        assert!(
+            (still - (foot + Vec3::Y * half)).length() < 1e-4,
+            "{kind}: still air, the light is in the flame's middle: {still:?}"
+        );
+
+        app.insert_resource(FlameWind { velocity: Vec2::new(3.0, 0.0) });
+        settle(&mut app);
+        let tilt = flame_tilt(3.0, kind.diameter());
+        let middle = foot + Vec3::new(half * tilt.sin(), half * tilt.cos(), 0.0);
+        let light = assigned(&mut app, 1)[0].1;
+        assert!(light.y > foot.y, "{kind}: the light sank under the flame's foot: {light:?}");
+        assert!(
+            (light - middle).length() < 1e-4,
+            "{kind}: {light:?} vs the leaned flame's middle {middle:?}"
+        );
+    }
+}
+
+// ---- more than one viewer (`FocusRule::Shared`, `docs/research/pool-foci.md`) --------------------------------
+
+/// How many of the pool's `size` assigned slots are lit within `radius` metres (on the ground plane) of `centre`.
+fn lit_near(app: &mut App, size: usize, centre: Vec3, radius: f32) -> usize {
+    assigned(app, size)
+        .into_iter()
+        .filter(|(_, at, visibility, _)| {
+            *visibility == Visibility::Inherited
+                && Vec2::new(at.x - centre.x, at.z - centre.z).length() <= radius
+        })
+        .count()
+}
+
+/// Two viewers 200 m apart: one among twenty fires 1-4.8 m from it, the other among three, 6-8 m from it.
+/// On a plain nearest-focus distance the twenty outrank the three and the second viewer gets nothing.
+fn two_viewers(order: impl Fn(usize) -> usize, many: usize) -> (App, Vec3, Vec3) {
+    let (a, b) = (Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0));
+    let mut app = app(LightPool { size: 8, reach: 30.0, focus: FocusRule::Shared, ..default() });
+    focus_at(&mut app, a);
+    focus_at(&mut app, b);
+    let mut fires: Vec<Vec3> = (0..many).map(|i| a + Vec3::new(1.0 + 0.2 * i as f32, 0.0, 0.0)).collect();
+    fires.extend([b + Vec3::new(6.0, 0.0, 0.0), b + Vec3::new(0.0, 0.0, 7.0), b + Vec3::new(0.0, 0.0, -8.0)]);
+    for i in 0..fires.len() {
+        candidate(&mut app, fires[order(i)], 100.0);
+    }
+    for _ in 0..60 {
+        app.update();
+    }
+    (app, a, b)
+}
+
+#[test]
+fn a_viewer_among_few_fires_is_not_starved_by_one_among_many() {
+    let (mut app, a, b) = two_viewers(|i| i, 20);
+    assert_eq!(lit_near(&mut app, 8, b, 20.0), 3, "all three of the sparse viewer's fires hold a light");
+    assert_eq!(lit_near(&mut app, 8, a, 20.0), 5, "the dense viewer keeps the rest of the pool");
+    let budget = app.world().resource::<PoolBudget>();
+    assert_eq!((budget.wanting, budget.granted(), budget.starved()), (23, 8, 15));
+}
+
+#[test]
+fn a_viewer_with_fewer_fires_than_its_share_leaves_the_rest_to_the_other() {
+    // Size 8, two viewers: four each. The second has three, the first takes five; with the second down to
+    // two, six.
+    let (mut app, a, b) = two_viewers(|i| i, 20);
+    // Despawn one of the second viewer's three fires: the one 6 m east of it.
+    let doomed: Entity = app
+        .world_mut()
+        .query_filtered::<(Entity, &Transform), With<PoolCandidate>>()
+        .iter(app.world())
+        .find(|(_, transform)| (transform.translation.x - 206.0).abs() < 1e-3)
+        .map(|(entity, _)| entity)
+        .expect("the fire exists");
+    app.world_mut().despawn(doomed);
+    for _ in 0..90 {
+        app.update();
+    }
+    assert_eq!(lit_near(&mut app, 8, b, 20.0), 2, "the second viewer has two fires left and holds both");
+    assert_eq!(lit_near(&mut app, 8, a, 20.0), 6, "what it does not use goes to the first");
+}
+
+#[test]
+fn the_assignment_does_not_depend_on_the_order_things_were_spawned_in() {
+    let lit = |order: &dyn Fn(usize) -> usize| {
+        let (mut app, ..) = two_viewers(order, 20);
+        let mut at: Vec<[i32; 3]> = assigned(&mut app, 8)
+            .into_iter()
+            .filter(|(_, _, visibility, _)| *visibility == Visibility::Inherited)
+            .map(|(_, at, ..)| {
+                [
+                    (at.x * 1000.0).round() as i32,
+                    (at.y * 1000.0).round() as i32,
+                    (at.z * 1000.0).round() as i32,
+                ]
+            })
+            .collect();
+        at.sort();
+        at
+    };
+    let forward = lit(&|i| i);
+    let backward = lit(&|i| 22 - i);
+    assert_eq!(forward.len(), 8);
+    assert_eq!(forward, backward, "the same eight fires are real in either spawn order");
+}
+
+#[test]
+fn a_fire_between_two_viewers_holds_one_light() {
+    let mut app = app(LightPool { size: 4, reach: 20.0, focus: FocusRule::Shared, ..default() });
+    focus_at(&mut app, Vec3::ZERO);
+    focus_at(&mut app, Vec3::new(10.0, 0.0, 0.0));
+    candidate(&mut app, Vec3::new(5.0, 0.0, 0.0), 100.0);
+    candidate(&mut app, Vec3::new(-3.0, 0.0, 0.0), 100.0);
+    for _ in 0..60 {
+        app.update();
+    }
+    let lit: Vec<Vec3> = assigned(&mut app, 4)
+        .into_iter()
+        .filter(|(_, _, visibility, _)| *visibility == Visibility::Inherited)
+        .map(|(_, at, ..)| at)
+        .collect();
+    assert_eq!(lit.len(), 2, "two fires, two lights, though one stands in both viewers' reach: {lit:?}");
+    assert_eq!(lit.iter().filter(|at| (at.x - 5.0).abs() < 1e-4).count(), 1, "the shared fire is lit once");
+}
+
+#[test]
+fn the_shared_rule_with_one_viewer_is_the_one_rule_frame_for_frame() {
+    // Forty fires placed by a fixed pseudo-random sequence, a focus that walks across them, and both rules:
+    // every slot's position, visibility and brightness, and the budget, agree on every frame.
+    let build = |focus: FocusRule| {
+        let mut app = app(LightPool { size: 6, reach: 14.0, focus, ..default() });
+        let eye = app.world_mut().spawn((TestFocus, Transform::default())).id();
+        let mut seed = 12345_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for _ in 0..40 {
+            let at = Vec3::new(next() * 40.0 - 20.0, 0.0, next() * 40.0 - 20.0);
+            candidate(&mut app, at, 50.0 + next() * 150.0);
+        }
+        (app, eye)
+    };
+    let (mut one, eye_one) = build(FocusRule::One);
+    let (mut shared, eye_shared) = build(FocusRule::Shared);
+    for frame in 0..150 {
+        let at = Vec3::new(-18.0 + frame as f32 * 0.24, 0.0, (frame as f32 * 0.05).sin() * 8.0);
+        one.world_mut().entity_mut(eye_one).insert(Transform::from_translation(at));
+        shared.world_mut().entity_mut(eye_shared).insert(Transform::from_translation(at));
+        one.update();
+        shared.update();
+        assert_eq!(slots(&mut one), slots(&mut shared), "frame {frame}");
+        assert_eq!(
+            one.world().resource::<PoolBudget>().holders,
+            shared.world().resource::<PoolBudget>().holders,
+            "frame {frame}"
+        );
+    }
+}
+
+#[test]
+fn a_viewer_who_leaves_hands_the_lights_to_the_one_who_stays() {
+    let mut app = app(LightPool { size: 4, reach: 30.0, focus: FocusRule::Shared, ..default() });
+    let (a, b) = (Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0));
+    focus_at(&mut app, a);
+    let away = app.world_mut().spawn((TestFocus, Transform::from_translation(b))).id();
+    for i in 0..6 {
+        candidate(&mut app, a + Vec3::new(1.0 + i as f32, 0.0, 0.0), 100.0);
+        candidate(&mut app, b + Vec3::new(1.0 + i as f32, 0.0, 0.0), 100.0);
+    }
+    for _ in 0..60 {
+        app.update();
+    }
+    assert_eq!(
+        (lit_near(&mut app, 4, a, 20.0), lit_near(&mut app, 4, b, 20.0)),
+        (2, 2),
+        "an equal share each"
+    );
+
+    app.world_mut().despawn(away);
+    for _ in 0..90 {
+        app.update();
+    }
+    assert_eq!(lit_near(&mut app, 4, a, 20.0), 4, "the viewer who stays has the whole pool");
+    assert_eq!(lit_near(&mut app, 4, b, 20.0), 0, "and nobody is near the one who left");
+
+    // A viewer joining takes its share back.
+    app.world_mut().spawn((TestFocus, Transform::from_translation(b)));
+    for _ in 0..90 {
+        app.update();
+    }
+    assert_eq!(
+        (lit_near(&mut app, 4, a, 20.0), lit_near(&mut app, 4, b, 20.0)),
+        (2, 2),
+        "an equal share again"
+    );
+}
+
+#[test]
+fn the_one_rule_still_leaves_two_viewers_dark() {
+    // The default is unchanged: two foci are a misconfiguration under `FocusRule::One`, and `Shared` is how
+    // a host asks for them.
+    let mut app = app(LightPool { size: 4, reach: 30.0, ..default() });
+    assert_eq!(LightPool::default().focus, FocusRule::One);
+    focus_at(&mut app, Vec3::ZERO);
+    focus_at(&mut app, Vec3::new(100.0, 0.0, 0.0));
+    candidate(&mut app, Vec3::new(1.0, 0.0, 0.0), 100.0);
+    candidate(&mut app, Vec3::new(101.0, 0.0, 0.0), 100.0);
+    for _ in 0..30 {
+        app.update();
+    }
+    assert_eq!(app.world().resource::<PoolBudget>().granted(), 0);
+}
+
+/// The sum of every shown pool light's base brightness, reserves included: what the lit scene is given.
+fn shown_total(app: &mut App) -> f32 {
+    app.world_mut()
+        .query::<(&PoolLight, &Visibility, &Flicker)>()
+        .iter(app.world())
+        .filter(|(_, visibility, _)| **visibility != Visibility::Hidden)
+        .map(|(_, _, flicker)| flicker.base)
+        .sum()
+}
+
+#[test]
+fn a_viewer_leaving_does_not_dip_the_pool_when_the_reserves_cover_the_lights_that_move() {
+    // Four lights, two viewers, so two lights change owner when one leaves: with two reserves each is
+    // cross-faded and the pool's total holds at every frame.
+    let mut app = app(LightPool { size: 4, reach: 30.0, focus: FocusRule::Shared, reserve: 2, ..default() });
+    focus_at(&mut app, Vec3::ZERO);
+    let away = app.world_mut().spawn((TestFocus, Transform::from_xyz(200.0, 0.0, 0.0))).id();
+    for i in 0..6 {
+        candidate(&mut app, Vec3::new(1.0 + i as f32, 0.0, 0.0), 100.0);
+        candidate(&mut app, Vec3::new(201.0 + i as f32, 0.0, 0.0), 100.0);
+    }
+    for _ in 0..80 {
+        app.update();
+    }
+    let whole = shown_total(&mut app);
+    assert!((whole - 400.0).abs() < 1e-3, "four lights at 100: {whole}");
+    app.world_mut().despawn(away);
+    for frame in 0..40 {
+        app.update();
+        let total = shown_total(&mut app);
+        assert!((total - 400.0).abs() < 1e-3, "frame {frame} after the viewer left: {total}");
+    }
+}
+
+/// A candidate at `at`, its light 2 m up, burning at `intensity` in `color`.
+fn coloured_candidate(app: &mut App, at: Vec3, intensity: f32, color: Option<Color>) -> Entity {
+    app.world_mut()
+        .spawn((
+            PoolCandidate { offset: Vec3::Y * 2.0, intensity, color, ..default() },
+            Transform::from_translation(at),
+        ))
+        .id()
+}
+
+/// The colour of the pool light in `slot`.
+fn colour_of(app: &mut App, slot: usize) -> Color {
+    app.world_mut()
+        .query::<(&PoolLight, &PointLight)>()
+        .iter(app.world())
+        .find(|(light, _)| light.slot == slot)
+        .map(|(_, light)| light.color)
+        .expect("the slot exists")
+}
+
+#[test]
+fn a_light_is_the_colour_of_the_fire_it_is_handed_to_and_gives_it_back_to_the_next() {
+    let mut app = app(LightPool { size: 1, reach: 50.0, gain: 1.0, reserve: 0, ..default() });
+    focus_at(&mut app, Vec3::ZERO);
+    let template = app.world().resource::<LightPool>().light.color;
+    let blue = Color::srgb(0.1, 0.3, 1.0);
+    let gas = coloured_candidate(&mut app, Vec3::new(1.0, 0.0, 0.0), 100.0, Some(blue));
+    settle(&mut app);
+    assert_eq!(colour_of(&mut app, 0), blue, "the blue fire's light is blue");
+    // The blue fire is put out and an orange one, with no colour of its own, is handed the light.
+    app.world_mut().entity_mut(gas).despawn();
+    coloured_candidate(&mut app, Vec3::new(2.0, 0.0, 0.0), 100.0, None);
+    settle(&mut app);
+    assert_eq!(
+        colour_of(&mut app, 0),
+        template,
+        "the next fire's light is the template's again, not the last one's"
+    );
+}
+
+#[test]
+fn a_hosts_palette_survives_a_coloured_fire_and_every_hand_off_between_plain_ones() {
+    let mut app = app(LightPool { size: 1, reach: 50.0, gain: 1.0, reserve: 0, ..default() });
+    focus_at(&mut app, Vec3::ZERO);
+    let first = coloured_candidate(&mut app, Vec3::new(1.0, 0.0, 0.0), 100.0, None);
+    settle(&mut app);
+    // The host's night palette: every pool light a dusk amber it chose itself.
+    let amber = Color::srgb(0.9, 0.45, 0.15);
+    for mut light in
+        app.world_mut().query_filtered::<&mut PointLight, With<PoolLight>>().iter_mut(app.world_mut())
+    {
+        light.color = amber;
+    }
+    app.update();
+    assert_eq!(
+        colour_of(&mut app, 0),
+        amber,
+        "no candidate has a colour, so the pool leaves the palette alone"
+    );
+    // A hand-off between two fires that have none leaves it too.
+    app.world_mut().entity_mut(first).despawn();
+    coloured_candidate(&mut app, Vec3::new(2.0, 0.0, 0.0), 100.0, None);
+    settle(&mut app);
+    assert_eq!(colour_of(&mut app, 0), amber);
+    // A violet fire takes the light and goes; the palette is what comes back.
+    let violet =
+        coloured_candidate(&mut app, Vec3::new(0.5, 0.0, 0.0), 100.0, Some(Color::srgb(0.6, 0.2, 1.0)));
+    settle(&mut app);
+    assert_eq!(colour_of(&mut app, 0), Color::srgb(0.6, 0.2, 1.0));
+    app.world_mut().entity_mut(violet).despawn();
+    settle(&mut app);
+    assert_eq!(colour_of(&mut app, 0), amber, "the host's palette, not the template's");
+}
+
+#[test]
+fn a_departing_light_fades_out_in_its_owners_colour_while_the_arriving_one_fades_in_in_its_own() {
+    let mut app = app(LightPool { size: 1, reach: 100.0, gain: 1.0, reserve: 1, ..default() });
+    focus_at(&mut app, Vec3::ZERO);
+    let blue = Color::srgb(0.1, 0.3, 1.0);
+    let green = Color::srgb(0.2, 1.0, 0.3);
+    let walker = coloured_candidate(&mut app, Vec3::new(1.0, 0.0, 0.0), 100.0, Some(blue));
+    settle(&mut app);
+    // A challenger twice as near takes the light, and the walker leaves the pool.
+    coloured_candidate(&mut app, Vec3::new(0.4, 0.0, 0.0), 100.0, Some(green));
+    app.world_mut().entity_mut(walker).despawn();
+    let mut seen_fading_out = false;
+    for _ in 0..6 {
+        app.update();
+        assert_eq!(
+            colour_of(&mut app, 0),
+            green,
+            "the slot is the arriving fire's from the frame it arrives"
+        );
+        let reserve = lights(&mut app)
+            .into_iter()
+            .find(|(slot, _, visibility, ..)| *slot == 1 && *visibility != Visibility::Hidden);
+        if reserve.is_some() {
+            seen_fading_out = true;
+            assert_eq!(colour_of(&mut app, 1), blue, "the light fading out is still the walker's blue");
+        }
+    }
+    assert!(seen_fading_out, "the reserve never showed, so the cross-fade was not tested");
+}
+
+/// The sum of every visible pool light's base: slots and reserves, the subject's whole pool of light.
+fn pool_total(app: &mut App) -> f32 {
+    slots(app)
+        .iter()
+        .map(|(_, _, visibility, base)| if *visibility == Visibility::Hidden { 0.0 } else { *base })
+        .sum()
+}
+
+#[test]
+fn a_light_handed_on_while_it_is_still_fading_in_fades_out_from_the_level_it_showed() {
+    // A slot whose owner changes twice inside one fade-in: the arriving light has reached a few per cent when the
+    // next challenger takes it, and the reserve that fades it out must start from that few per cent, not from the full
+    // intensity it never reached. Started from full, the pool's light jumped by nearly a whole light on that frame
+    // (the courtyard's `LIGHTS_FOCUS_WALK=18 LIGHTS_POOL=4 LIGHTS_SEED=3 LIGHTS_HYSTERESIS=1.0`: +57 000 lm of 943 000
+    // at frame 235, a visible pop on the pillars and the floor beside it).
+    let mut app =
+        app(LightPool { size: 1, reach: 100.0, gain: 1.0, reserve: 2, hysteresis: 1.0, ..default() });
+    focus_at(&mut app, Vec3::ZERO);
+    candidate(&mut app, Vec3::new(1.0, 0.0, 0.0), 100.0);
+    settle(&mut app);
+    assert!((pool_total(&mut app) - 100.0).abs() < 1.0, "one light, burning at 100");
+    // A nearer candidate takes the light: the slot restarts its fade from nothing.
+    candidate(&mut app, Vec3::new(0.6, 0.0, 0.0), 100.0);
+    settle(&mut app);
+    app.update();
+    // An even nearer one takes it a few frames into that fade-in, while the arriving light is at a few per cent.
+    candidate(&mut app, Vec3::new(0.3, 0.0, 0.0), 100.0);
+    let mut last = pool_total(&mut app);
+    let mut steepest = 0.0f32;
+    for _ in 0..8 {
+        app.update();
+        let now = pool_total(&mut app);
+        steepest = steepest.max(now - last);
+        last = now;
+    }
+    // The fade-in itself is a smoothstep over 0.35 s: at its steepest it adds about 7 a frame to a light of 100.
+    assert!(
+        steepest < 15.0,
+        "the pool's light jumped by {steepest} in a frame of a hand-off that should be seamless"
+    );
 }

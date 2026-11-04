@@ -32,6 +32,8 @@
 //! `LIGHTS_EYE`, `LIGHTS_LOOK`, `LIGHTS_SEED` and `LIGHTS_POOL` come from `examples/common/mod.rs`. `LIGHTS_EV100=x` sets the camera's exposure (default 6; 9 is a dark frame whose ground is not saturated by the fires). `LIGHTS_DEPTH_FADE=1`
 //! sets `FlameSite::depth_fade` on every flame and gives the camera a `DepthPrepass`; the occlusion
 //! case it is for has its own scene in `examples/occlusion.rs`.
+//! `LIGHTS_MOTION=g` sets how much of a fire's own velocity counts as wind (`FlameMotion::gain`; default 1, the torch-bearers' flames
+//! stream behind them as they walk; `0` is the courtyard as it was, every flame upright).
 //! `LIGHTS_RANK=distance` (rank by distance alone, the old rule), `LIGHTS_REACH`, `LIGHTS_FOCUS_WALK` (the focus's orbit radius; past the pool's reach the torches
 //! stream across the boundary, which is what makes a candidate leave the pool) and `LIGHTS_POOL_LOG`
 //! (the pool's total every frame, the only way to see a hand-off) are also this example's own.
@@ -48,6 +50,13 @@
 //! `LIGHTS_GPU_TIMING=1` (with `LIGHTS_FRAMES=420`) prints the mean GPU time per render pass on stdout.
 //! The default camera is the eye at `(0, 9, 16)` looking at the origin.
 //!
+//! `LIGHTS_FOCI=n` gives the pool `n` foci (up to 8), one orbiting at each `n`th of the orbit, with
+//! [`FocusRule::Shared`] so the pool's lights are shared between them (`docs/research/pool-foci.md`), and a
+//! small cyan marker on each so the overview camera shows who the viewers are. `LIGHTS_SPLIT=1` is the
+//! split-screen courtyard: two such viewers, each with its own camera on half of the window, standing behind
+//! its focus and looking in (`LIGHTS_EYE` and `LIGHTS_LOOK` do not apply to it). `LIGHTS_FOCUS_RULE=one`
+//! keeps the default rule over the same foci, which leaves the pool dark: the comparison.
+//!
 //! ```sh
 //! LIGHTS_FRAMES=600 LIGHTS_SHOT=/tmp/court.png cargo run --release --example courtyard
 //! ```
@@ -57,15 +66,19 @@ mod common;
 use std::f32::consts::TAU;
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::Exposure;
+use bevy::camera::{Exposure, Viewport};
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::window::PrimaryWindow;
 use bevy_lights::*;
 
-use common::{Draw, ExampleHarness, camera, camera_placement, gust_env, seed, wind_env};
+use common::{
+    Draw, ExampleHarness, GpuTiming, camera, camera_placement, gust_env, motion_env, render_plugin, seed,
+    wind_env,
+};
 
 /// How many torch-bearers walk the courtyard.
 const BEARERS: usize = 48;
@@ -74,9 +87,6 @@ const BEARERS: usize = 48;
 // ---- and the sky. Every lumen below is derived from these, not hand-picked. The numbers and their
 // ---- sources are in `docs/research/lighting-look.md`.
 
-/// The temperature a wood fire burns at, in kelvin: the warm half of the scene, and the colour every
-/// fire's light and flame is taken from.
-const FIRE_KELVIN: f32 = 1900.0;
 /// The temperature the camera is balanced to: tungsten, 2856 K (CIE Illuminant A), the standing
 /// convention for a firelit night. Against it a fire at 1900 K reads orange and the sky at 8000 K
 /// reads blue, so the scene's warm/cool split comes from two temperatures and one balance rather
@@ -340,66 +350,10 @@ fn shadowed_env() -> usize {
     std::env::var("LIGHTS_SHADOWED").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
 }
 
-/// `LIGHTS_GPU_TIMING=1` records the render graph's GPU timestamps and prints, once, the mean per pass
-/// (microseconds, frames 100 to 400) on stdout as `gpu_us <pass> <mean>`. It needs a Vulkan or DX12
-/// adapter with timestamp queries; without one the run prints nothing. Run it with `LIGHTS_FRAMES=420`.
-fn gpu_timing_on() -> bool {
-    std::env::var("LIGHTS_GPU_TIMING").is_ok_and(|v| v != "0")
-}
-
-fn report_gpu(
-    store: Res<bevy::diagnostic::DiagnosticsStore>,
-    mut sums: Local<std::collections::BTreeMap<String, (f64, u32)>>,
-    mut frame: Local<u32>,
-) {
-    *frame += 1;
-    if (100..400).contains(&*frame) {
-        for d in store.iter().filter(|d| d.path().as_str().ends_with("elapsed_gpu")) {
-            if let Some(ms) = d.value() {
-                let entry = sums.entry(d.path().to_string()).or_default();
-                entry.0 += ms;
-                entry.1 += 1;
-            }
-        }
-    }
-    if *frame == 400 {
-        for (path, (sum, n)) in sums.iter() {
-            println!("gpu_us {path} {:.1}", sum / f64::from((*n).max(1)) * 1000.0);
-        }
-    }
-}
-
-/// Adds the render diagnostics and the report when `LIGHTS_GPU_TIMING` asks for them.
-struct GpuTiming;
-
-impl Plugin for GpuTiming {
-    fn build(&self, app: &mut App) {
-        if gpu_timing_on() {
-            app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
-                .add_systems(Update, report_gpu);
-        }
-    }
-}
-
 fn main() {
     let (eye, look) = camera_placement(Vec3::new(0.0, 9.0, 16.0), Vec3::ZERO);
     App::new()
-        .add_plugins(
-            DefaultPlugins.set(bevy::render::RenderPlugin {
-                render_creation: bevy::render::settings::WgpuSettings {
-                    features: if gpu_timing_on() {
-                        bevy::render::settings::WgpuFeatures::TIMESTAMP_QUERY
-                            | bevy::render::settings::WgpuFeatures::TIMESTAMP_QUERY_INSIDE_PASSES
-                            | bevy::render::settings::WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS
-                    } else {
-                        bevy::render::settings::WgpuFeatures::empty()
-                    },
-                    ..Default::default()
-                }
-                .into(),
-                ..Default::default()
-            }),
-        )
+        .add_plugins(DefaultPlugins.set(render_plugin()))
         .add_plugins((ExampleHarness, FlickerPlugin, LightPoolPlugin::<Focus>::default(), FlamePlugin))
         .insert_resource(CameraPlacement(eye, look))
         // The pool is inserted before the plugin's `init_resource`, so these numbers win: eight real
@@ -429,6 +383,7 @@ fn main() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(FADE_SECONDS),
             reach: std::env::var("LIGHTS_REACH").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0),
+            focus: focus_rule(),
             light: PointLight {
                 color: fire_colour(),
                 // The same windowed falloff the fires have: the pool light is a torch's fire, one
@@ -450,9 +405,15 @@ fn main() {
         // once here, before any site spawns (the height is packed as a fraction of it).
         .insert_resource(FlameLook { color: fire_temperature(), strength: 0.82, max_height: 4.0 })
         .insert_resource(FlameWind { velocity: wind_env().unwrap_or_default() })
+        // `LIGHTS_MOTION=0` is the courtyard as it was before a fire's own motion counted: every bearer's flame upright.
+        .insert_resource(FlameMotion {
+            gain: motion_env().unwrap_or(FlameMotion::default().gain),
+            ..default()
+        })
         .insert_resource(GlobalAmbientLight { color: Color::WHITE, brightness: 0.0, ..default() })
         .add_systems(Startup, (spawn_scene, spawn_camera, gust_from_env).chain())
         .add_systems(Update, (walk_bearers, orbit_focus, relight_braziers, snuff_braziers).chain())
+        .add_systems(Update, follow_viewers.after(orbit_focus))
         .add_systems(Update, (report_kindled, report_snuffed))
         .add_systems(Update, report_look)
         .add_systems(Update, report_flicker)
@@ -477,6 +438,41 @@ fn gust_from_env(mut commands: Commands) {
 #[derive(Component)]
 struct Focus;
 
+/// Which viewer a `Focus` is, under `LIGHTS_FOCI` or `LIGHTS_SPLIT`: `0` is the left half of a split window.
+#[derive(Component)]
+struct Viewer(usize);
+
+/// The camera of a viewer, under `LIGHTS_SPLIT`: it fills its half of the window and follows its focus.
+#[derive(Component)]
+struct ViewerCamera(usize);
+
+/// `LIGHTS_SPLIT=1`: two viewers on one scene, a camera each.
+fn split_on() -> bool {
+    std::env::var("LIGHTS_SPLIT").is_ok_and(|v| v != "0")
+}
+
+/// How many foci the pool has: two for a split screen, `LIGHTS_FOCI=n` (1 to 8), or one.
+fn foci_count() -> usize {
+    if split_on() {
+        return 2;
+    }
+    std::env::var("LIGHTS_FOCI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (1..=8).contains(n))
+        .unwrap_or(1)
+}
+
+/// The pool's focus rule: shared between the viewers when there are several, or `One` (also with
+/// `LIGHTS_FOCUS_RULE=one`, the default rule over the same foci).
+fn focus_rule() -> FocusRule {
+    match std::env::var("LIGHTS_FOCUS_RULE").ok().as_deref() {
+        Some("one") => FocusRule::One,
+        _ if foci_count() > 1 => FocusRule::Shared,
+        _ => FocusRule::One,
+    }
+}
+
 /// A brazier: the coals, their light and their flame.
 #[derive(Component, Clone, Copy)]
 struct Brazier;
@@ -497,10 +493,44 @@ fn depth_fade_on() -> bool {
     std::env::var("LIGHTS_DEPTH_FADE").is_ok_and(|v| v != "0")
 }
 
+/// A fire's own colour in the courtyard: the light's hue, and the flame's, which is the same hue brighter where the hue weighs little
+/// (a blue has half the luminance of the scene's orange at the same channel values, so a flame of it is scaled up to be as prominent
+/// as its neighbours: a flame colour above 1 is a brighter fire).
+struct Hue {
+    light: Color,
+    flame: Color,
+}
+
+/// `LIGHTS_COLOURS=1` gives some fires a colour of their own, on the flame, its sparks and its light at once: braziers 1 and 2 burn a
+/// gas-flame blue and a witch-fire green, and every fifth torch a shrine violet or a blue. Unset or `0`, every fire is the scene's
+/// orange and the courtyard draws exactly as it always has.
+fn palette(index: usize, brazier: bool) -> Option<Hue> {
+    if !std::env::var("LIGHTS_COLOURS").is_ok_and(|v| v != "0") {
+        return None;
+    }
+    let hue = |r: f32, g: f32, b: f32, flame: f32| Hue {
+        light: Color::from(LinearRgba::rgb(r, g, b)),
+        flame: Color::from(LinearRgba::rgb(r * flame, g * flame, b * flame)),
+    };
+    match (brazier, index) {
+        (true, 1) => Some(hue(0.10, 0.32, 1.0, 1.8)),
+        (true, 2) => Some(hue(0.20, 1.0, 0.30, 1.0)),
+        (false, i) if i % 5 == 1 => Some(hue(0.10, 0.32, 1.0, 1.8)),
+        (false, i) if i % 5 == 3 => Some(hue(0.62, 0.20, 1.0, 1.6)),
+        _ => None,
+    }
+}
+
 /// `LIGHTS_EMBERS=r` gives every flame `FlameEmbers { rate: r }` (sparks a second); unset or `0`, the courtyard draws no sparks.
 fn embers_on() -> Option<FlameEmbers> {
     let rate: f32 = std::env::var("LIGHTS_EMBERS").ok()?.trim().parse().ok()?;
     (rate > 0.0).then_some(FlameEmbers { rate })
+}
+
+/// `LIGHTS_SMOKE=d` gives every flame `FlameSmoke { density: d }`; unset or `0`, the courtyard draws no smoke.
+fn smoke_on() -> Option<FlameSmoke> {
+    let density: f32 = std::env::var("LIGHTS_SMOKE").ok()?.trim().parse().ok()?;
+    (density > 0.0).then_some(FlameSmoke { density })
 }
 
 /// `LIGHTS_EV100=x` overrides the camera's exposure (default [`NIGHT_EV100`]). A higher value is a darker
@@ -509,10 +539,9 @@ fn exposure_ev100() -> f32 {
     std::env::var("LIGHTS_EV100").ok().and_then(|v| v.parse().ok()).unwrap_or(NIGHT_EV100)
 }
 
-fn spawn_camera(mut commands: Commands, placement: Res<CameraPlacement>, fill: Res<NightFill>) {
-    let CameraPlacement(eye, look) = *placement;
-    let mut camera = commands.spawn((
-        camera(eye, look, 8.0),
+/// What the night adds to a camera: a cool fill the moon does not have to provide, and the exposure.
+fn night_view() -> impl Bundle {
+    (
         // A cool fill the moon does not have to provide: the sky dome under it, which lights the faces
         // the moon's direction misses. Without it a figure's shadow thrown by a fire onto a wall the moon
         // does not reach is a black hole (`srgb(1,1,5)` at 2 cd/m²); at 20 (about 63 lx, an eighth of the
@@ -520,10 +549,30 @@ fn spawn_camera(mut commands: Commands, placement: Res<CameraPlacement>, fill: R
         // hand-picked blue.
         AmbientLight { color: sky_colour(), brightness: 20.0, ..default() },
         Exposure { ev100: exposure_ev100() },
-    ));
-    // The depth fade reads the depth prepass, so a camera that asks for it carries one.
-    if depth_fade_on() {
-        camera.insert(DepthPrepass);
+    )
+}
+
+fn spawn_camera(mut commands: Commands, placement: Res<CameraPlacement>, fill: Res<NightFill>) {
+    let CameraPlacement(eye, look) = *placement;
+    if split_on() {
+        // Two cameras on one window, a viewer each (the viewports are set by `follow_viewers`, which knows
+        // the window's size and where its focus is).
+        for index in 0..2 {
+            commands.spawn((
+                Name::new(format!("Viewer {index} camera")),
+                Camera3d::default(),
+                Camera { order: index as isize, ..default() },
+                ViewerCamera(index),
+                Transform::from_translation(eye).looking_at(look, Vec3::Y),
+                night_view(),
+            ));
+        }
+    } else {
+        let mut camera = commands.spawn((camera(eye, look, 8.0), night_view()));
+        // The depth fade reads the depth prepass, so a camera that asks for it carries one.
+        if depth_fade_on() {
+            camera.insert(DepthPrepass);
+        }
     }
     // The moon: the host's directional light (the crate never adds one), a sky-coloured fill at the
     // illuminance that makes the target key-to-fill against the braziers' pools.
@@ -547,6 +596,37 @@ fn spawn_camera(mut commands: Commands, placement: Res<CameraPlacement>, fill: R
             0.0,
         )),
     ));
+}
+
+/// Under `LIGHTS_SPLIT`: each viewer's camera fills its half of the window and stands behind its own focus,
+/// 1.7 times as far from the courtyard's middle, looking in at the stone about the focus.
+fn follow_viewers(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    foci: Query<(&Viewer, &Transform), Without<ViewerCamera>>,
+    mut cameras: Query<(&ViewerCamera, &mut Camera, &mut Transform), Without<Viewer>>,
+) {
+    let Ok(window) = windows.single() else { return };
+    let size = window.physical_size();
+    if size.x < 2 || size.y == 0 {
+        return;
+    }
+    let half = UVec2::new(size.x / 2, size.y);
+    for (ViewerCamera(index), mut camera, mut transform) in &mut cameras {
+        let physical_position = UVec2::new(*index as u32 * half.x, 0);
+        let placed = camera
+            .viewport
+            .as_ref()
+            .is_some_and(|v| v.physical_position == physical_position && v.physical_size == half);
+        if !placed {
+            camera.viewport = Some(Viewport { physical_position, physical_size: half, ..default() });
+        }
+        if let Some((_, focus)) = foci.iter().find(|(viewer, _)| viewer.0 == *index) {
+            let p = focus.translation;
+            let eye = Vec3::new(p.x * 1.7, 3.0, p.z * 1.7);
+            let look = Vec3::new(p.x * 0.55, 0.9, p.z * 0.55);
+            *transform = Transform::from_translation(eye).looking_at(look, Vec3::Y);
+        }
+    }
 }
 
 /// Where the camera goes, read once at startup so the systems do not read the environment again.
@@ -732,6 +812,7 @@ fn spawn_scene(
     // The four braziers.
     for (index, at) in BRAZIERS.iter().enumerate() {
         let phase = index as f32 * 1.9;
+        let colour = palette(index, true);
         commands
             .spawn((
                 Name::new(format!("Brazier {index}")),
@@ -767,7 +848,7 @@ fn spawn_scene(
                     .spawn((
                         Name::new("Coals"),
                         PointLight {
-                            color: fire_colour(),
+                            color: colour.as_ref().map_or_else(fire_colour, |hue| hue.light),
                             intensity: lumens,
                             range: BRAZIER_POOL * POOL_RANGE_MARGIN,
                             shadow_maps_enabled: true,
@@ -796,12 +877,16 @@ fn spawn_scene(
                         depth: brazier_kind().map_or(FLICKER_DEPTH, FireKind::depth),
                         depth_fade: depth_fade_on(),
                         fire: Some(coals),
+                        color: colour.as_ref().map(|hue| hue.flame),
                     },
                     // The flame's foot is on the coals, below the lip with them.
                     Transform::from_xyz(0.0, BRAZIER_TOP * 0.5 + 0.04 - BED_BELOW_LIP, 0.0),
                 ));
                 if let Some(embers) = embers_on() {
                     site.insert(embers);
+                }
+                if let Some(smoke) = smoke_on() {
+                    site.insert(smoke);
                 }
             });
     }
@@ -831,6 +916,7 @@ fn spawn_scene(
         // output — and it is the case the old distance-only rule got wrong.
         let lantern = index % 6 == 0;
         let burn = if lantern { 4.0 } else { 1.0 };
+        let colour = palette(index, false);
         commands
             .spawn((
                 Name::new(format!("Bearer {index}")),
@@ -907,6 +993,7 @@ fn spawn_scene(
                         // flame drawn on it instead of the pool slot's phase.
                         phase: Some(phase),
                         diameter: None,
+                        color: colour.as_ref().map(|hue| hue.light),
                         ..default()
                     },
                     // The pool's lights flicker at the un-sized rate (`Flicker { diameter: None }` in
@@ -920,17 +1007,39 @@ fn spawn_scene(
                         depth: FLICKER_DEPTH,
                         depth_fade: depth_fade_on(),
                         fire: Some(fire),
+                        color: colour.as_ref().map(|hue| hue.flame),
                     },
                     Transform::from_translation(at),
                 ));
                 if let Some(embers) = embers_on() {
                     torch.insert(embers);
                 }
+                if let Some(smoke) = smoke_on() {
+                    torch.insert(smoke);
+                }
             });
     }
 
-    // The focus the pool measures from.
-    commands.spawn((Name::new("Focus"), Focus, Transform::default()));
+    // The foci the pool measures from: one, or one per viewer, each an equal share of the orbit behind the
+    // last. Under `LIGHTS_FOCI` (one camera) each carries a small cyan marker so the overview shows who
+    // the viewers are.
+    let marker = (foci_count() > 1 && !split_on()).then(|| {
+        (
+            meshes.add(Sphere::new(0.14)),
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(0.0, 0.9, 1.0),
+                unlit: true,
+                ..default()
+            }),
+        )
+    });
+    for index in 0..foci_count() {
+        let name = if index == 0 { "Focus".to_string() } else { format!("Focus {}", index + 1) };
+        let mut focus = commands.spawn((Name::new(name), Focus, Viewer(index), Transform::default()));
+        if let Some((mesh, material)) = marker.clone() {
+            focus.insert((Mesh3d(mesh), MeshMaterial3d(material), NotShadowCaster));
+        }
+    }
 }
 
 fn walk_bearers(time: Res<Time>, mut bearers: Query<(&mut Bearer, &mut Transform)>) {
@@ -946,8 +1055,8 @@ fn walk_bearers(time: Res<Time>, mut bearers: Query<(&mut Bearer, &mut Transform
     }
 }
 
-/// Orbits the focus at 6 m on a 20 s period./// Orbits the focus at 6 m on a 20 s period.
-fn orbit_focus(time: Res<Time>, mut focus: Query<&mut Transform, With<Focus>>) {
+/// Orbits each focus at 6 m on a 20 s period, each viewer an equal share of the orbit behind the last.
+fn orbit_focus(time: Res<Time>, mut focus: Query<(&mut Transform, &Viewer), With<Focus>>) {
     let elapsed = time.elapsed_secs();
     // `LIGHTS_FOCUS_WALK=<radius>` sends the focus out to that radius instead of its 6 m orbit. With a
     // radius past the pool's reach the torches stream across the reach boundary as it goes round, which
@@ -958,9 +1067,12 @@ fn orbit_focus(time: Res<Time>, mut focus: Query<&mut Transform, With<Focus>>) {
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|r| *r > 0.0)
         .unwrap_or(6.0);
-    let at = Vec3::new(radius * (elapsed * TAU / 20.0).cos(), 1.2, radius * (elapsed * TAU / 20.0).sin());
-    for mut transform in &mut focus {
-        transform.translation = at;
+    // A split screen's two viewers stand a quarter of the orbit apart, so their halves are not mirror images
+    // of each other; any other number of foci share the orbit equally.
+    let step = if split_on() { TAU / 4.0 } else { TAU / foci_count() as f32 };
+    for (mut transform, Viewer(index)) in &mut focus {
+        let angle = elapsed * TAU / 20.0 + *index as f32 * step;
+        transform.translation = Vec3::new(radius * angle.cos(), 1.2, radius * angle.sin());
     }
 }
 

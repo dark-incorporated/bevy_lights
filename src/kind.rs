@@ -2,8 +2,12 @@
 
 use bevy::prelude::*;
 
-use crate::model::{CALM_FLICKER_DEPTH, FLICKER_DEPTH, WHIPPING_FLICKER_DEPTH, fire_lumens, flicker_rate};
-use crate::{FlameEmbers, FlameSite, Flicker, MAX_EMBER_RATE, PoolCandidate};
+use crate::model::{
+    CALM_FLICKER_DEPTH, FLICKER_DEPTH, WHIPPING_FLICKER_DEPTH, fire_lumens, flame_light_offset, flicker_rate,
+};
+use crate::{
+    FlameEmbers, FlameSite, FlameSmoke, FlameTongues, Flicker, FuelBed, MAX_EMBER_RATE, PoolCandidate,
+};
 
 /// A named kind of fire: its fuel-bed diameter, flicker depth and flame height together, so a
 /// picker (or a project file) stores one word instead of three loose numbers.
@@ -13,7 +17,9 @@ use crate::{FlameEmbers, FlameSite, Flicker, MAX_EMBER_RATE, PoolCandidate};
 /// light's and the flame's settings **from the same three numbers**, so the two breathe together.
 /// Only the brazier row is a number the crate shipped before; the rest are design defaults
 /// (`docs/research/fire-kinds.md`). Spell the rest of a fire with struct update:
-/// `FlameSite { phase: 1.3, ..FireKind::Torch.site() }`.
+/// `FlameSite { phase: 1.3, ..FireKind::Torch.site() }`. A kind carries no colour (all six are soot-incandescent
+/// fuels, the scene's orange): a fire of another hue sets [`FlameSite::color`] and [`PoolCandidate::color`] the
+/// same way, `FlameSite { color: Some(blue), ..FireKind::Lantern.site() }`.
 ///
 /// ```
 /// # use bevy_lights::*;
@@ -113,14 +119,25 @@ impl FireKind {
     }
 
     /// The pool candidate for this fire, sized like [`light`](Self::light): its mean lights
-    /// [`reach`](Self::reach) to `lux` with the light `over` metres above the ground. `offset` is
-    /// zero (put the candidate on the [`FlameSite`] entity, whose origin is the flame's foot), `phase`
-    /// is `None`, and `diameter` and `depth` are this kind's, so the light a torch is handed breathes
-    /// at the flame's own rate and depth.
+    /// [`reach`](Self::reach) to `lux` with the light `over` metres above the ground. `over` is the height
+    /// of the light, which stands at the middle of the flame: `offset` is
+    /// [`flame_light_offset`]`(`[`height`](Self::height)`)`, so a candidate on the [`FlameSite`] entity (whose
+    /// origin is the flame's foot) is handed a light inside its flame, and in a [`FlameWind`](crate::FlameWind)
+    /// the pool moves it with the leaned flame's middle. `phase` is `None`, and `diameter` and `depth` are this
+    /// kind's, so the light a torch is handed breathes at the flame's own rate and depth.
     pub fn candidate(self, lux: f32, over: f32) -> PoolCandidate {
+        self.candidate_at_mean(self.lumens(lux, over))
+    }
+
+    /// The pool candidate for this fire whose light averages `mean` lumens: [`candidate`](Self::candidate) with the
+    /// budget written rather than solved from a pool's lux, as [`flicker`](Self::flicker) is to [`light`](Self::light).
+    /// `offset`, `diameter` and `depth` are this kind's, `phase` and `color` are `None`; [`Fire`](crate::Fire) is
+    /// the one that sets them.
+    pub fn candidate_at_mean(self, mean: f32) -> PoolCandidate {
         PoolCandidate {
+            offset: Vec3::from(flame_light_offset(self.height())),
             diameter: Some(self.diameter()),
-            ..PoolCandidate::at_mean(self.lumens(lux, over), self.depth())
+            ..PoolCandidate::at_mean(mean, self.depth())
         }
     }
 
@@ -144,22 +161,60 @@ impl FireKind {
         Some(FlameEmbers { rate })
     }
 
-    /// The flame and its light in one bundle: [`site`](Self::site) and [`candidate`](Self::candidate),
-    /// so a flame never goes without the light the pool hands it and both come from the same kind.
-    /// Spawn it on the entity at the flame's foot; `lux` and `over` are [`lumens`](Self::lumens)'
-    /// arguments. The sparks stay separate because a candle or a lantern has none and a bundle
-    /// cannot hold an absent component: `if let Some(e) = kind.embers() { entity.insert(e); }`.
+    /// The smoke this fire gives off, or `None` for one that gives none worth drawing (a lantern's enclosed wick). A wood or
+    /// pitch fire smokes more than a clean one: a candle a thin wisp, a charcoal brazier little, a torch, a campfire and a
+    /// bonfire a column. Insert the value on the [`FlameSite`] entity, as [`embers`](Self::embers). A design default
+    /// (`docs/research/flame-smoke.md`).
+    pub fn smoke(self) -> Option<FlameSmoke> {
+        let density = match self {
+            FireKind::Lantern => return None,
+            FireKind::Candle => 0.25,
+            FireKind::Torch => 0.8,
+            FireKind::Campfire => 0.9,
+            FireKind::Brazier => 0.5,
+            FireKind::Bonfire => crate::MAX_SMOKE_DENSITY,
+        };
+        Some(FlameSmoke { density })
+    }
+
+    /// The tongues this fire burns as, or `None` for one whose bed is no wider than its one flame can fill (a candle, a lantern's wick, a
+    /// torch and a brazier: a bed under a third of the flame's height). A campfire's 0.8 m bed under a 0.7 m flame is six tongues over
+    /// 0.55 m, and a bonfire's 3 m pyre under a 2 m flame nine over 1.6 m: drawn as the one slender flame they were, both read as a very
+    /// large candle. Insert the value on the [`FlameSite`] entity, as [`embers`](Self::embers). A design default
+    /// (`docs/research/flame-tongues.md`).
+    pub fn tongues(self) -> Option<FlameTongues> {
+        match self {
+            FireKind::Campfire => Some(FlameTongues { count: 6, spread: 0.55 }),
+            FireKind::Bonfire => Some(FlameTongues { count: 9, spread: 1.6 }),
+            FireKind::Candle | FireKind::Lantern | FireKind::Torch | FireKind::Brazier => None,
+        }
+    }
+
+    /// The bed of coals this fire burns on, or `None` for one with no bed worth drawing (a candle's wick, a lantern's, a torch's wrapped
+    /// head). A campfire's is its 0.8 m ring less the stones, a bonfire's the pyre's glowing floor under its tongues, a brazier's the
+    /// coal bed in its bowl. Insert the value on the [`FlameSite`] entity, as [`embers`](Self::embers); the coals follow the site's fire
+    /// (`FlameSite::fire`), breathing with its flicker and glowing on after it is put out. A design default
+    /// (`docs/research/fuel-bed-heat.md`).
     ///
     /// ```
     /// # use bevy_lights::*;
-    /// # use bevy::prelude::*;
-    /// # let mut world = World::new();
-    /// let torch = world.spawn(FireKind::Torch.fire(40.0, 1.8)).id();
-    /// assert!(world.entity(torch).contains::<FlameSite>());
-    /// assert!(world.entity(torch).contains::<PoolCandidate>());
+    /// assert!(FireKind::Torch.bed().is_none());
+    /// for kind in FireKind::ALL {
+    ///     if let Some(bed) = kind.bed() {
+    ///         assert!(bed.problems().is_empty());
+    ///         // The bed is a little narrower than the fuel it sits in.
+    ///         assert!(bed.diameter <= kind.diameter());
+    ///     }
+    /// }
     /// ```
-    pub fn fire(self, lux: f32, over: f32) -> (FlameSite, PoolCandidate) {
-        (self.site(), self.candidate(lux, over))
+    pub fn bed(self) -> Option<FuelBed> {
+        let diameter = match self {
+            FireKind::Candle | FireKind::Lantern | FireKind::Torch => return None,
+            FireKind::Brazier => 0.30,
+            FireKind::Campfire => 0.7,
+            FireKind::Bonfire => 1.9,
+        };
+        Some(FuelBed { diameter, ..FuelBed::default() })
     }
 
     /// The fire's name, as a picker shows it.
@@ -184,6 +239,7 @@ impl FireKind {
     /// depth fade, no linked fire.
     pub fn site(self) -> FlameSite {
         FlameSite {
+            color: None,
             height: self.height(),
             phase: 0.0,
             kindle: 0.0,

@@ -10,7 +10,8 @@
 //! shape, its noise and their provenance are documented at the top of `src/flame.wesl`.
 
 use bevy::asset::embedded_asset;
-use bevy::camera::visibility::NoFrustumCulling;
+use bevy::camera::primitives::Aabb;
+use bevy::camera::visibility::NoAutoAabb;
 use bevy::light::NotShadowCaster;
 use bevy::mesh::{MeshTag, MeshVertexBufferLayoutRef};
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin, MeshMaterial3d};
@@ -22,9 +23,11 @@ use bevy::time::Real;
 use crate::LightsSystems;
 use crate::chain_sets;
 use crate::flicker::{Flicker, Kindle, Snuff};
+use crate::model::fire_colour::{CORE_YELLOW, EDGE_RED, EMBER_RED};
 use crate::model::{
-    DEFAULT_FIRE_DIAMETER, FLICKER_DEPTH, KINDLE_SECONDS, flame_tilt, flicker_swing, kindle_gain,
-    pack_flame_tag, set_flame_brightness, snuff_gain,
+    DEFAULT_FIRE_DIAMETER, FLAME_TILT_LIMIT, FLICKER_DEPTH, KINDLE_SECONDS, flame_cull_extents, flame_tilt,
+    flicker_swing, kindle_gain, pack_flame_tag, relative_air, retint, set_flame_brightness, snuff_gain,
+    unpack_flame_tag,
 };
 use crate::pool::PoolCandidate;
 
@@ -43,42 +46,63 @@ impl Plugin for FlamePlugin {
         chain_sets(app);
         embedded_asset!(app, "flame.wesl");
         crate::embers::build(app);
+        crate::smoke::build(app);
+        crate::bed::build(app);
         app.add_plugins(MaterialPlugin::<FlameMaterial>::default())
             .init_resource::<FlameLook>()
             .init_resource::<FlameAssets>()
+            .init_resource::<crate::FlameMotion>()
+            .init_resource::<crate::motion::MovingSites>()
+            .register_type::<crate::FlameMotion>()
+            .register_type::<crate::FlameVelocity>()
             .register_type::<FlameLook>()
             .register_type::<FlameWind>()
             .register_type::<FlameGust>()
             .register_type::<FlameSite>()
             .register_type::<Flame>()
+            .register_type::<crate::FlameTongues>()
+            .register_type::<crate::FlameTongue>()
             .add_systems(
                 Update,
                 (
                     gust_wind,
                     dress_flames,
+                    crate::tongues::dress_tongues,
                     update_flames,
                     crate::embers::dress_embers,
                     crate::embers::update_embers,
+                    crate::smoke::dress_smoke,
+                    crate::smoke::update_smoke,
+                    crate::smoke::begin_smoke_tails,
+                    crate::smoke::update_smoke_tails,
+                    crate::bed::build_bed_assets.run_if(crate::bed::wanted),
+                    crate::bed::update_beds,
                 )
                     .chain()
                     .in_set(LightsSystems::Flame),
             )
+            .add_systems(Update, crate::motion::track_flame_velocity.before(LightsSystems::Pool))
             .add_systems(Startup, build_flame_assets);
         crate::report::watch::<FlameSite>(app);
         crate::report::watch::<crate::FlameEmbers>(app);
+        crate::report::watch::<crate::FlameSmoke>(app);
+        crate::report::watch::<crate::FlameTongues>(app);
+        crate::report::watch::<crate::FuelBed>(app);
         crate::report::watch_resource::<FlameLook>(app);
         crate::report::watch_resource::<FlameWind>(app);
+        crate::report::watch_resource::<crate::FlameMotion>(app);
         crate::report::watch_resource::<FlameGust>(app);
     }
 }
 
-/// The flame material: the host's fire colour (`.a` is the ember's strength, which scales the flame)
-/// and the animation's clock and shape.
+/// The flame material: a fire's colour (`.a` is the ember's strength, which scales the flame), the
+/// ramp that colour makes, and the animation's clock and shape.
 ///
-/// A host never builds one of these. [`FlamePlugin`] keeps a single material for every flame in the
-/// scene, because the numbers that make two fires burn differently ride on each flame's
-/// [`MeshTag`], not in the material. Change [`FlameLook`] to change the colour, the strength or the
-/// height scale.
+/// A host never builds one of these. [`FlamePlugin`] keeps one material for the scene's fire colour (two
+/// with the depth fade) and one more for each colour a [`FlameSite::color`] asks for, shared by every
+/// flame of that colour, because the numbers that make two fires burn differently ride on each flame's
+/// [`MeshTag`], not in the material. Change [`FlameLook`] to change the scene's colour, the strength or
+/// the height scale.
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 pub struct FlameMaterial {
     #[uniform(0)]
@@ -89,6 +113,15 @@ pub struct FlameMaterial {
     /// another's), `w` the ember strength.
     #[uniform(0)]
     params: Vec4,
+    /// The ramp's cool rim and tip (`retint(EDGE_RED, base)`).
+    #[uniform(0)]
+    edge: Vec4,
+    /// The ramp's hot core (`retint(CORE_YELLOW, base)`).
+    #[uniform(0)]
+    core: Vec4,
+    /// What the ramp tends to while the fire is still catching (`retint(EMBER_RED, base)`).
+    #[uniform(0)]
+    ember: Vec4,
 }
 
 impl Material for FlameMaterial {
@@ -145,7 +178,7 @@ impl Material for FlameMaterial {
 // visible entity has no visibility of its own.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[require(Visibility)]
+#[require(Visibility, crate::FlameVelocity)]
 #[reflect(Component)]
 pub struct FlameSite {
     /// How tall the flame is, in world units.
@@ -208,6 +241,26 @@ pub struct FlameSite {
     /// kindle settles (`docs/research/flame-relight.md`). The site's own [`kindle`](FlameSite::kindle) does not apply
     /// while a linked kindle runs.
     pub fire: Option<Entity>,
+    /// The fire's own colour: the middle of its flame's ramp, what [`FlameLook::color`] is for every fire that
+    /// sets none, and the colour of its sparks ([`FlameEmbers`](crate::FlameEmbers)). The rest of the ramp is the
+    /// same flame in that hue (a darker, more saturated rim and a paler core,
+    /// [`retint`](crate::retint)), so a blue gas lantern, a green witch-fire and a violet shrine brazier are
+    /// each one clean colour and not an orange flame tinted over.
+    ///
+    /// **Give it the hue of the light this flame motivates** (the [`PointLight::color`] of the fire's
+    /// light, or [`PoolCandidate::color`] on a prop the pool lights): a flame that burns one colour and
+    /// throws another reads as a mistake, not a mood (`docs/research/fire-colour.md`). Channels are linear
+    /// and non-negative, and the green channel is clamped to 1 as it is for [`FlameLook::color`]; a value above 1
+    /// in the others is a brighter fire. Hues weigh unequally: at the same channel values a blue flame has half the
+    /// luminance of the scene's orange one, so a flame colour scaled up (the light's hue times 1.8, say) is how a blue
+    /// fire is as prominent as its neighbours while its light stays the hue.
+    ///
+    /// `None` (the default) is the scene's fire colour and the scene's shared materials, exactly as drawn
+    /// before this field existed. Every distinct colour is one more material (and one more batch), shared by
+    /// every flame of that colour and released with the last of them, so a handful of colours is free and a
+    /// colour changed every frame is a material a frame. May be changed at any time; [`FlamePlugin`] moves the
+    /// flame to the right material.
+    pub color: Option<Color>,
 }
 
 impl FlameSite {
@@ -224,6 +277,12 @@ impl FlameSite {
             positive(&mut out, "diameter", d);
         }
         within(&mut out, "depth", self.depth, 0.0, crate::MAX_FLICKER_DEPTH);
+        if let Some(color) = self.color {
+            let color = LinearRgba::from(color);
+            non_negative(&mut out, "color.red", color.red);
+            non_negative(&mut out, "color.green", color.green);
+            non_negative(&mut out, "color.blue", color.blue);
+        }
         out
     }
 }
@@ -313,8 +372,9 @@ impl FlameLook {
 /// metres converts first. `x` is the world's X and `y` the world's Z (`Vec3::new(v.x, 0.0, v.y)` is
 /// the direction the air moves).
 ///
-/// The lean is drawn in the flame's own quad; the fire's light does not move with it
-/// (`docs/research/flame-wind.md`, Deviations).
+/// The lean is drawn in the flame's own quad, and the pool's light for the fire moves with it: a pooled
+/// light on the [`FlameSite`]'s entity (or one the site's `fire` names) is carried to where the leaned flame's
+/// middle is ([`lean_light_shift`](crate::lean_light_shift), `docs/research/flame-lean-light.md`).
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Reflect)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(default))]
 #[reflect(Resource)]
@@ -419,14 +479,90 @@ fn gust_wind(
 /// `y` and `z` are `1 +` the downwind lean (`sin θ` along world X and Z). Lengths, not directions, so a
 /// parent's rotation cannot change them; `1 +` keeps them positive. Written only when it changes, so a
 /// flame in still air costs nothing.
-fn set_scale(transform: &mut Transform, took: f32, lean: Vec2) {
+///
+/// The flame's culling box goes with it. The scale is the shader's data, not a size, so it distorts the
+/// box the frustum test builds from the transform; [`flame_cull_extents`] divides the distortion out, and
+/// so the box is rewritten on exactly the frames the scale is, and not otherwise.
+fn set_scale(transform: &mut Transform, bound: &mut Aabb, height: f32, took: f32, lean: Vec2) {
     let scale = Vec3::new(took, 1.0 + lean.x, 1.0 + lean.y);
     if transform.scale != scale {
         transform.scale = scale;
+        bound.half_extents = Vec3A::from(flame_cull_extents(height, took, lean.to_array()));
     }
 }
 
-/// The one mesh, the two materials, and the height scale every flame in the scene shares.
+/// What tells one tinted material from the next: a fire's colour (as the bits of the linear channels the ramp is built from, with
+/// the green clamped, so two sites that pass the same number share a material) and whether it is the depth-fade variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TintKey {
+    rgb: [u32; 3],
+    depth_fade: bool,
+}
+
+impl TintKey {
+    /// The key of the material a fire of `color` is drawn with.
+    pub(crate) fn new(color: Color, depth_fade: bool) -> Self {
+        let color = LinearRgba::from(color);
+        Self { rgb: [color.red.to_bits(), color.green.min(1.0).to_bits(), color.blue.to_bits()], depth_fade }
+    }
+
+    /// The colour the key stands for: the middle of the ramp.
+    pub(crate) fn rgb(self) -> [f32; 3] {
+        self.rgb.map(f32::from_bits)
+    }
+}
+
+/// The materials a scene's tinted fires share, one per [`TintKey`]. It holds **ids**, not handles: the flames that use a
+/// material hold it, so the asset is dropped with the last of them and [`sweep`](Self::sweep) forgets the key, and a fire
+/// whose colour is changed every frame costs one live material rather than one for every colour it has ever been.
+pub(crate) struct TintedMaterials<M: Asset> {
+    ids: std::collections::HashMap<TintKey, AssetId<M>>,
+}
+
+impl<M: Asset> Default for TintedMaterials<M> {
+    fn default() -> Self {
+        Self { ids: std::collections::HashMap::new() }
+    }
+}
+
+impl<M: Asset> TintedMaterials<M> {
+    /// The id of the live material for `key`, if there is one.
+    pub(crate) fn id(&self, key: &TintKey) -> Option<AssetId<M>> {
+        self.ids.get(key).copied()
+    }
+
+    /// The ids of every live tinted material.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = AssetId<M>> + '_ {
+        self.ids.values().copied()
+    }
+
+    /// Whether no tinted material is live.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// A strong handle on the material for `key`: the live one, or a new one `make` builds.
+    pub(crate) fn handle(
+        &mut self,
+        key: TintKey,
+        materials: &mut Assets<M>,
+        make: impl FnOnce() -> M,
+    ) -> Handle<M> {
+        if let Some(handle) = self.ids.get(&key).and_then(|id| materials.get_strong_handle(*id)) {
+            return handle;
+        }
+        let handle = materials.add(make());
+        self.ids.insert(key, handle.id());
+        handle
+    }
+
+    /// Forgets the colours whose last flame has gone.
+    pub(crate) fn sweep(&mut self, materials: &Assets<M>) {
+        self.ids.retain(|_, id| materials.contains(*id));
+    }
+}
+
+/// The one mesh, the scene's two materials, the tinted ones, and the height scale every flame in the scene shares.
 #[derive(Resource, Default)]
 pub(crate) struct FlameAssets {
     mesh: Handle<Mesh>,
@@ -434,6 +570,8 @@ pub(crate) struct FlameAssets {
     /// The same material with the depth fade on, for the sites that set [`FlameSite::depth_fade`]. Two
     /// shared materials rather than one per flame, so a scene with the fade off draws exactly as it did.
     faded_material: Handle<FlameMaterial>,
+    /// The materials of the sites that set [`FlameSite::color`], one per colour and fade setting.
+    tinted: TintedMaterials<FlameMaterial>,
     /// The height scale the material was built with ([`FlameLook::max_height`] at `Startup`): a
     /// [`FlameSite`]'s height is packed as a fraction of it, so the CPU packer and the shader must
     /// agree on it.
@@ -454,9 +592,37 @@ impl FlameAssets {
         self.max_height
     }
 
-    /// The shared material a site's flame is drawn with.
+    /// The scene's shared material a site with no colour of its own is drawn with.
     fn material_for(&self, depth_fade: bool) -> &Handle<FlameMaterial> {
         if depth_fade { &self.faded_material } else { &self.material }
+    }
+
+    /// The id of the material a site of `color` is drawn with, when it exists yet: the scene's for `None`, the tinted one
+    /// otherwise. Cheap, so a flame already on it is not touched.
+    fn material_id(&self, color: Option<Color>, depth_fade: bool) -> Option<AssetId<FlameMaterial>> {
+        match color {
+            None => Some(self.material_for(depth_fade).id()),
+            Some(color) => self.tinted.id(&TintKey::new(color, depth_fade)),
+        }
+    }
+
+    /// The material a site of `color` is drawn with, made if no flame has used it yet.
+    fn material_of(
+        &mut self,
+        color: Option<Color>,
+        depth_fade: bool,
+        look: &FlameLook,
+        materials: &mut Assets<FlameMaterial>,
+    ) -> Handle<FlameMaterial> {
+        match color {
+            None => self.material_for(depth_fade).clone(),
+            Some(color) => {
+                let key = TintKey::new(color, depth_fade);
+                self.tinted.handle(key, materials, || {
+                    FlameMaterial::new(key.rgb(), look.strength, look.max_height, depth_fade)
+                })
+            }
+        }
     }
 }
 
@@ -477,70 +643,146 @@ pub(crate) fn build_flame_assets(
     // camera and scales it by the flame's height, so the model is a unit square in the local XY
     // plane about its origin.
     assets.mesh = meshes.add(Rectangle::new(1.0, 1.0));
-    assets.material = materials.add(material_for(*look, false));
-    assets.faded_material = materials.add(material_for(*look, true));
+    assets.material =
+        materials.add(FlameMaterial::new(scene_colour(&look), look.strength, look.max_height, false));
+    assets.faded_material =
+        materials.add(FlameMaterial::new(scene_colour(&look), look.strength, look.max_height, true));
     assets.max_height = look.max_height;
     assets.built = true;
 }
 
-/// The material for a [`FlameLook`]: its colour (green clamped, so a palette's oversaturated fire does
-/// not blow the ramp out) and its strength as the ember's weight. `depth_fade` is the material of the
-/// sites that asked for [`FlameSite::depth_fade`]: the same flame with the shader's depth test turned on.
-fn material_for(look: FlameLook, depth_fade: bool) -> FlameMaterial {
-    FlameMaterial {
-        base: LinearRgba {
-            red: look.color.red,
-            green: look.color.green.min(1.0),
-            blue: look.color.blue,
-            alpha: look.strength,
-        },
-        params: Vec4::new(0.0, look.max_height, if depth_fade { 1.0 } else { 0.0 }, look.strength),
+/// The middle of the ramp a [`FlameLook`] asks for: its colour with the green clamped, so a palette's oversaturated fire does
+/// not blow the ramp out.
+pub(crate) fn scene_colour(look: &FlameLook) -> [f32; 3] {
+    [look.color.red, look.color.green.min(1.0), look.color.blue]
+}
+
+impl FlameMaterial {
+    /// The material of a fire of colour `mid` (the middle of its ramp) at `strength` (the ember's weight).
+    /// `depth_fade` is the material of the sites that asked for [`FlameSite::depth_fade`]: the same flame with
+    /// the shader's depth test turned on.
+    fn new(mid: [f32; 3], strength: f32, max_height: f32, depth_fade: bool) -> Self {
+        let mut material = Self {
+            base: LinearRgba::NONE,
+            params: Vec4::new(0.0, max_height, if depth_fade { 1.0 } else { 0.0 }, strength),
+            edge: Vec4::ZERO,
+            core: Vec4::ZERO,
+            ember: Vec4::ZERO,
+        };
+        material.recolour(mid, strength);
+        material
+    }
+
+    /// Writes the fire's colour and the ramp it makes: the shipped orange ramp's rim, core and catch colour moved
+    /// to `mid`'s hue ([`retint`]).
+    fn recolour(&mut self, mid: [f32; 3], strength: f32) {
+        let stop = |stop| {
+            let [red, green, blue] = retint(stop, mid);
+            Vec4::new(red, green, blue, 0.0)
+        };
+        self.base = LinearRgba { red: mid[0], green: mid[1], blue: mid[2], alpha: strength };
+        self.edge = stop(EDGE_RED);
+        self.core = stop(CORE_YELLOW);
+        self.ember = stop(EMBER_RED);
     }
 }
 
-/// Gives every [`FlameSite`] without one a single [`Flame`] child.
+/// The components of one flame of `site`: its clock `phase` and `height` and its starting brightness on a [`MeshTag`], at `offset` from
+/// the site's origin, with the crate's own culling box and the material of the site's colour and fade. The first flame of a site is one
+/// of these at the origin with the site's own phase and height, and each extra tongue of a [`FlameTongues`](crate::FlameTongues) fire
+/// is another. `kindled` is the flame's own catch clock (`f32::MAX`: caught).
+///
+/// The starting brightness is the site's own swing at the site's own phase, the phase the *light* breathes at: a tongue's clock is
+/// turned from it and its brightness is not, since one fire breathes as one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flame_parts(
+    site: &FlameSite,
+    height: f32,
+    phase: f32,
+    kindled: f32,
+    offset: Vec3,
+    assets: &mut FlameAssets,
+    materials: &mut Assets<FlameMaterial>,
+    look: &FlameLook,
+    t: f32,
+) -> (Flame, MeshTag, Mesh3d, MeshMaterial3d<FlameMaterial>, Transform, NotShadowCaster, Aabb, NoAutoAabb) {
+    let brightness = flicker_swing(site.diameter, site.depth, t, site.phase);
+    let packed = pack_flame_tag(phase, height, brightness, assets.max_height);
+    // The culling box of a flame at full scale: `update_flames` rewrites it with the scale.
+    let height = unpack_flame_tag(packed, assets.max_height).1;
+    let bound =
+        Aabb { center: Vec3A::ZERO, half_extents: Vec3A::from(flame_cull_extents(height, 1.0, [0.0; 2])) };
+    (
+        Flame { kindled, source: None },
+        MeshTag::new(packed),
+        Mesh3d(assets.mesh.clone()),
+        MeshMaterial3d(assets.material_of(site.color, site.depth_fade, look, materials)),
+        Transform::from_translation(offset),
+        NotShadowCaster,
+        // Bevy's own box is the unit square's, which neither covers the drawn flame nor survives the scale
+        // (`flame_cull_extents`): the box is this crate's, and Bevy must leave it alone.
+        bound,
+        NoAutoAabb,
+    )
+}
+
+/// Gives every [`FlameSite`] without one a single [`Flame`] child (a site with [`FlameTongues`](crate::FlameTongues) gets its extra
+/// tongues from the system after this one).
 ///
 /// The child carries the site's height, phase and starting brightness on its [`MeshTag`] (see
-/// [`pack_flame_tag`](crate::pack_flame_tag)), stands at the site's own origin, and is neither a
-/// shadow caster nor frustum culled — the vertex stage scales the unit quad, so the mesh's own
-/// `Aabb` does not cover what is drawn. The starting brightness is the fire's swing at the frame it
-/// spawns, so the very first frame a flame is drawn it already matches its light.
+/// [`pack_flame_tag`](crate::pack_flame_tag)), stands at the site's own origin, and is not a shadow
+/// caster. Its culling box is the crate's own ([`flame_cull_extents`]), because the vertex stage scales
+/// the unit quad and reads the transform's scale as data, so the mesh's own `Aabb` neither covers what
+/// is drawn nor survives the scale: a flame outside every camera's frustum is not extracted or drawn.
+/// The starting brightness is the fire's swing at the frame it spawns, so the very first frame a flame
+/// is drawn it already matches its light.
 ///
 /// Spawned through `queue_silenced`: a site despawned in the same frame it was created (a short
 /// fire's lifetime running out, a carried torch going away) must not panic the insert.
 pub(crate) fn dress_flames(
     mut commands: Commands,
     sites: Query<(Entity, &FlameSite), Without<Flamed>>,
-    assets: Res<FlameAssets>,
+    mut assets: ResMut<FlameAssets>,
+    mut materials: ResMut<Assets<FlameMaterial>>,
+    look: Res<FlameLook>,
     time: Res<Time>,
 ) {
     if !assets.built {
         return;
     }
-    let max_height = assets.max_height;
     let t = time.elapsed_secs();
     for (site, flame) in &sites {
-        let catch = flame.kindle;
-        let brightness = flicker_swing(flame.diameter, flame.depth, t, flame.phase);
-        let tag = MeshTag::new(pack_flame_tag(flame.phase, flame.height, brightness, max_height));
-        let mesh = assets.mesh.clone();
-        let material = assets.material_for(flame.depth_fade).clone();
+        let kindled = if flame.kindle > 0.0 { 0.0 } else { f32::MAX };
+        let parts = flame_parts(
+            flame,
+            flame.height,
+            flame.phase,
+            kindled,
+            Vec3::ZERO,
+            &mut assets,
+            &mut materials,
+            &look,
+            t,
+        );
         commands.entity(site).queue_silenced(move |mut site: EntityWorldMut| {
             site.insert(Flamed).with_children(|parent| {
-                parent.spawn((
-                    Name::new("Flame"),
-                    Flame { kindled: if catch > 0.0 { 0.0 } else { f32::MAX }, source: None },
-                    tag,
-                    Mesh3d(mesh),
-                    MeshMaterial3d(material),
-                    Transform::IDENTITY,
-                    NotShadowCaster,
-                    NoFrustumCulling,
-                ));
+                parent.spawn((Name::new("Flame"), parts));
             });
         });
     }
 }
+
+/// What [`update_flames`] reads and writes of a flame: its catch and source, its transform and the culling box that
+/// goes with the transform's scale, its tag and material, and the site it is a child of.
+type FlameParts = (
+    &'static mut Flame,
+    &'static mut Transform,
+    &'static mut Aabb,
+    &'static mut MeshTag,
+    &'static mut MeshMaterial3d<FlameMaterial>,
+    &'static ChildOf,
+    Option<&'static crate::FlameTongue>,
+);
 
 /// Ticks the flames' shared clock, writes each flame's own brightness, and applies a changed
 /// [`FlameLook`].
@@ -559,15 +801,9 @@ pub(crate) fn update_flames(
     real: Res<Time<Real>>,
     time: Res<Time>,
     look: Res<FlameLook>,
-    assets: Res<FlameAssets>,
+    mut assets: ResMut<FlameAssets>,
     mut materials: ResMut<Assets<FlameMaterial>>,
-    mut flames: Query<(
-        &mut Flame,
-        &mut Transform,
-        &mut MeshTag,
-        &mut MeshMaterial3d<FlameMaterial>,
-        &ChildOf,
-    )>,
+    mut flames: Query<FlameParts>,
     sites: Sites,
 ) {
     if !assets.built {
@@ -579,31 +815,39 @@ pub(crate) fn update_flames(
     let dt = real.delta_secs();
     let t = time.elapsed_secs();
     // The wind this frame: speed and the unit direction it blows towards, on the ground plane.
-    let wind = sites.wind.as_deref().map_or((0.0, Vec2::ZERO), |w| {
-        let speed = w.velocity.length();
-        (speed, if speed > 0.0 && speed.is_finite() { w.velocity / speed } else { Vec2::ZERO })
-    });
-    for (mut flame, mut transform, mut tag, mut material, parent) in &mut flames {
-        let (site, owner) = sites.sites.get(parent.parent()).map_or((None, None), |(s, o)| (Some(s), o));
+    let wind = sites.wind.as_deref().map_or((0.0, Vec2::ZERO), |w| air_of(w.velocity));
+    let gain = sites.motion.as_deref().map_or(1.0, |m| m.gain);
+    let max_height = assets.max_height;
+    for (mut flame, mut transform, mut bound, mut tag, mut material, parent, tongue) in &mut flames {
+        let height = unpack_flame_tag(tag.value, max_height).1;
+        let (site, travel, owner) = sites
+            .sites
+            .get(parent.parent())
+            .map_or((None, Vec2::ZERO, None), |(s, v, o)| (Some(s), v.ground, o));
         let source = owner.map(ChildOf::parent).filter(|owner| !sites.sites.contains(*owner));
         if flame.source != source {
             flame.source = source;
         }
         let mut lean = Vec2::ZERO;
         if let Some(site) = site {
-            // A site whose `depth_fade` changed moves its flame to the other shared material; the comparison
-            // reads through `Deref`, so a flame that did not change is not marked changed.
-            let wanted = assets.material_for(site.depth_fade);
-            if material.0 != *wanted {
-                material.0 = wanted.clone();
+            // A site whose `depth_fade` or `color` changed moves its flame to the material of its new fire; the comparison
+            // reads through `Deref` and an id, so a flame that did not change is not marked changed.
+            if assets.material_id(site.color, site.depth_fade) != Some(material.0.id()) {
+                material.0 = assets.material_of(site.color, site.depth_fade, &look, &mut materials);
             }
             // Only when the brightness byte actually changes: `MeshTag` is in `bevy_pbr`'s
             // `Changed<MeshTag>` re-extraction set, so a write here costs a render-world re-extract for
             // that flame. The byte holds 1/255 of the swing, so at 60 fps a 2.6 Hz fire skips some
             // frames; a fire that never changes costs nothing at all.
             let (diameter, depth, phase) = sites.fire_of(site);
-            if wind.0 > 0.0 && wind.0.is_finite() {
-                lean = wind.1 * flame_tilt(wind.0, diameter.unwrap_or(DEFAULT_FIRE_DIAMETER)).sin();
+            // The air this fire meets: the wind, less its own velocity when it is moving. A fire at rest takes the frame's wind as it was.
+            let air = if travel == Vec2::ZERO {
+                wind
+            } else {
+                air_of(Vec2::from(relative_air(sites.wind_velocity().to_array(), travel.to_array(), gain)))
+            };
+            if air.0 > 0.0 && air.0.is_finite() {
+                lean = air.1 * flame_tilt(air.0, diameter.unwrap_or(DEFAULT_FIRE_DIAMETER)).sin();
             }
             let brightness = flicker_swing(diameter, depth, t, phase);
             let packed = set_flame_brightness(tag.value, brightness);
@@ -611,11 +855,18 @@ pub(crate) fn update_flames(
                 tag.value = packed;
             }
         }
+        // An outer tongue of a wide fire leans in towards the middle one, on top of the wind's lean: a fire draws air in at its foot, so
+        // its tongues converge on a tip instead of standing as a row (`docs/research/flame-tongues.md`). The tongue's lean is in its
+        // site's frame; the shader reads the lean in the world's axes, as the wind's is. The sum stays inside the tilt the wind is capped at.
+        if let Some(tongue) = tongue {
+            lean =
+                (lean + sites.turned(parent.parent(), tongue.lean)).clamp_length_max(FLAME_TILT_LIMIT.sin());
+        }
         // A linked fire put out is its light's `Snuff`, on the same `snuff_gain` the light's intensity is multiplied by,
         // so the flame leaves with its light. It outranks a catch, as `Snuff` outranks `Kindle` on the light; removing
         // it hands the scale back through the settled branch below.
         if let Some(elapsed) = site.and_then(|site| sites.snuff_of(site)) {
-            set_scale(&mut transform, snuff_gain(elapsed).max(0.001), lean);
+            set_scale(&mut transform, &mut bound, height, snuff_gain(elapsed).max(0.001), lean);
             if flame.kindled < f32::MAX {
                 flame.kindled = f32::MAX;
             }
@@ -627,7 +878,7 @@ pub(crate) fn update_flames(
         if let Some(elapsed) =
             site.and_then(|site| sites.kindle_of(site)).filter(|elapsed| *elapsed < KINDLE_SECONDS)
         {
-            set_scale(&mut transform, kindle_gain(elapsed).max(0.001), lean);
+            set_scale(&mut transform, &mut bound, height, kindle_gain(elapsed).max(0.001), lean);
             if flame.kindled < f32::MAX {
                 flame.kindled = f32::MAX;
             }
@@ -635,7 +886,7 @@ pub(crate) fn update_flames(
         }
         if flame.kindled >= f32::MAX {
             // Done catching. A link whose `Kindle` has gone leaves the scale where it stopped; put it back.
-            set_scale(&mut transform, 1.0, lean);
+            set_scale(&mut transform, &mut bound, height, 1.0, lean);
             continue;
         }
         flame.kindled = (flame.kindled + dt).min(f32::MAX);
@@ -643,27 +894,35 @@ pub(crate) fn update_flames(
         let gain = if catch > 0.0 { kindle_gain(flame.kindled.min(catch)) } else { 1.0 };
         // Width and height both: a fire that is catching is smaller in both, and a flame that grew tall
         // while staying wide would read as a sheet. The brightness is in the tag and is written above.
-        set_scale(&mut transform, gain.max(0.001), lean);
+        set_scale(&mut transform, &mut bound, height, gain.max(0.001), lean);
         if flame.kindled >= catch {
             flame.kindled = f32::MAX;
-            set_scale(&mut transform, 1.0, lean);
+            set_scale(&mut transform, &mut bound, height, 1.0, lean);
         }
     }
+    // The tinted materials a flame no longer uses are gone with their last flame; forget their colours.
+    if !assets.tinted.is_empty() {
+        assets.tinted.sweep(&materials);
+    }
     let elapsed = real.elapsed_secs_wrapped();
-    for handle in [&assets.material, &assets.faded_material] {
-        let Some(mut made) = materials.get_mut(handle) else {
+    let scene = scene_colour(&look);
+    let scene_materials = [assets.material.id(), assets.faded_material.id()];
+    for (id, is_scene) in
+        scene_materials.into_iter().map(|id| (id, true)).chain(assets.tinted.ids().map(|id| (id, false)))
+    {
+        let Some(mut made) = materials.get_mut(id) else {
             continue;
         };
         made.params.x = elapsed;
         if look.is_changed() {
             // Rewritten in place: a `FlameLook` change is a colour or strength change, and rebuilding
-            // the material would re-prepare every flame's pipeline for nothing.
-            made.base = LinearRgba {
-                red: look.color.red,
-                green: look.color.green.min(1.0),
-                blue: look.color.blue,
-                alpha: look.strength,
-            };
+            // the material would re-prepare every flame's pipeline for nothing. The scene's colour is the scene's
+            // materials' only: a fire that asked for a colour of its own keeps it.
+            if is_scene {
+                made.recolour(scene, look.strength);
+            } else {
+                made.base.alpha = look.strength;
+            }
             made.params.y = look.max_height;
             made.params.w = look.strength;
         }
@@ -673,21 +932,42 @@ pub(crate) fn update_flames(
 /// The flame sites, and the lights their [`FlameSite::fire`] links may name: one parameter, since `update_flames` reads both.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct Sites<'w, 's> {
-    sites: Query<'w, 's, (&'static FlameSite, Option<&'static ChildOf>)>,
+    sites: Query<'w, 's, (&'static FlameSite, &'static crate::FlameVelocity, Option<&'static ChildOf>)>,
+    globals: Query<'w, 's, &'static GlobalTransform>,
     lights: Query<'w, 's, (Option<&'static Flicker>, Option<&'static PoolCandidate>)>,
     kindles: Query<'w, 's, &'static Kindle>,
     snuffs: Query<'w, 's, &'static Snuff>,
     wind: Option<Res<'w, FlameWind>>,
+    motion: Option<Res<'w, crate::FlameMotion>>,
+}
+
+/// A wind's speed and the unit direction it blows towards, on the ground plane; no direction for a wind that is zero or not a number.
+fn air_of(velocity: Vec2) -> (f32, Vec2) {
+    let speed = velocity.length();
+    (speed, if speed > 0.0 && speed.is_finite() { velocity / speed } else { Vec2::ZERO })
 }
 
 impl Sites<'_, '_> {
+    /// The wind this frame, on the ground plane; still air with no [`FlameWind`].
+    fn wind_velocity(&self) -> Vec2 {
+        self.wind.as_deref().map_or(Vec2::ZERO, |w| w.velocity)
+    }
+
     /// The `elapsed` of the [`Kindle`] on the entity a site's [`FlameSite::fire`] names, when it has one.
-    fn kindle_of(&self, site: &FlameSite) -> Option<f32> {
+    pub(crate) fn kindle_of(&self, site: &FlameSite) -> Option<f32> {
         self.kindles.get(site.fire?).ok().map(|kindle| kindle.elapsed)
     }
 
+    /// `lean`, written in the frame of the site `site`, in the world's axes: the site's own turn about the vertical carries it.
+    fn turned(&self, site: Entity, lean: Vec2) -> Vec2 {
+        self.globals.get(site).map_or(lean, |at| {
+            let turned = at.rotation() * Vec3::new(lean.x, 0.0, lean.y);
+            Vec2::new(turned.x, turned.z)
+        })
+    }
+
     /// The `elapsed` of the [`Snuff`] on the entity a site's [`FlameSite::fire`] names, when it has one.
-    fn snuff_of(&self, site: &FlameSite) -> Option<f32> {
+    pub(crate) fn snuff_of(&self, site: &FlameSite) -> Option<f32> {
         self.snuffs.get(site.fire?).ok().map(|snuff| snuff.elapsed)
     }
 
@@ -695,7 +975,7 @@ impl Sites<'_, '_> {
     /// has a [`Flicker`] or a [`PoolCandidate`], otherwise the site's own. A `Flicker` wins over a candidate on the same
     /// entity, since the pool's own light is the `Flicker`. A candidate's missing depth is [`FLICKER_DEPTH`] and its missing
     /// phase the site's, as the pool reads them.
-    fn fire_of(&self, site: &FlameSite) -> (Option<f32>, f32, f32) {
+    pub(crate) fn fire_of(&self, site: &FlameSite) -> (Option<f32>, f32, f32) {
         let own = (site.diameter, site.depth, site.phase);
         let Some((flicker, candidate)) = site.fire.and_then(|light| self.lights.get(light).ok()) else {
             return own;
@@ -754,6 +1034,7 @@ mod tests {
             .world_mut()
             .spawn((
                 FlameSite {
+                    color: None,
                     height: 0.9,
                     phase: 0.4,
                     kindle: 0.0,
@@ -782,6 +1063,7 @@ mod tests {
         let mut app = dressing_app();
         app.world_mut().spawn((
             FlameSite {
+                color: None,
                 height: 0.35,
                 phase: 2.5,
                 kindle: 0.0,
@@ -819,6 +1101,7 @@ mod tests {
         let mut app = dressing_app();
         app.world_mut().spawn((
             FlameSite {
+                color: None,
                 height: 0.35,
                 phase: 2.5,
                 kindle: 0.0,
@@ -846,6 +1129,7 @@ mod tests {
         let mut app = dressing_app();
         app.world_mut().spawn((
             FlameSite {
+                color: None,
                 height: 0.35,
                 phase: 2.5,
                 kindle: 0.0,
@@ -878,6 +1162,7 @@ mod tests {
         let light =
             app.world_mut().spawn(Flicker { phase: 1.3, diameter: Some(0.3), depth: 0.30, ..default() }).id();
         let site = FlameSite {
+            color: None,
             height: 0.35,
             phase: 2.5,
             kindle: 0.0,
@@ -916,6 +1201,7 @@ mod tests {
         let candidate = app.world_mut().spawn(PoolCandidate { depth: Some(0.30), ..default() }).id();
         let bare = app.world_mut().spawn(PoolCandidate::default()).id();
         let site = |fire| FlameSite {
+            color: None,
             height: 0.35,
             phase: 2.5,
             kindle: 0.0,
@@ -950,6 +1236,7 @@ mod tests {
         for fire in [gone, bare] {
             app.world_mut().spawn((
                 FlameSite {
+                    color: None,
                     height: 0.35,
                     phase: 2.5,
                     kindle: 0.0,
@@ -985,6 +1272,7 @@ mod tests {
         let site = |fire| {
             (
                 FlameSite {
+                    color: None,
                     height: 0.35,
                     phase: 0.0,
                     kindle: 0.0,
@@ -1044,6 +1332,7 @@ mod tests {
         let site = |fire| {
             (
                 FlameSite {
+                    color: None,
                     height: 0.35,
                     phase: 0.0,
                     kindle: 0.0,
@@ -1091,6 +1380,7 @@ mod tests {
             let mut app = dressing_app();
             app.world_mut().spawn((
                 FlameSite {
+                    color: None,
                     height: 0.35,
                     phase: 2.5,
                     kindle: 0.0,
@@ -1160,6 +1450,7 @@ mod tests {
         }
         let mut app = dressing_app();
         let site = |depth_fade| FlameSite {
+            color: None,
             height: 0.9,
             phase: 0.0,
             kindle: 0.0,
@@ -1203,6 +1494,7 @@ mod tests {
             .world_mut()
             .spawn((
                 FlameSite {
+                    color: None,
                     height: 0.35,
                     phase: 0.7,
                     kindle: 0.0,
@@ -1237,6 +1529,7 @@ mod tests {
     #[test]
     fn a_flame_names_the_prop_its_site_hangs_on_and_follows_a_reparent() {
         let site_of = || FlameSite {
+            color: None,
             height: 0.35,
             phase: 0.0,
             kindle: 0.0,
@@ -1268,6 +1561,172 @@ mod tests {
         app.world_mut().entity_mut(on_torch).remove::<ChildOf>();
         app.update();
         assert_eq!(source_of(&mut app, on_torch), Some(None), "an unparented site has no source");
+    }
+
+    /// The material a site's flame is drawn with, copied out: its colour, ramp and handle.
+    fn drawn_with(app: &App, site: Entity) -> (Handle<FlameMaterial>, FlameMaterial) {
+        let flame = app
+            .world()
+            .get::<Children>(site)
+            .and_then(|c| c.first().copied())
+            .expect("a dressed site has a flame");
+        let handle = app.world().get::<MeshMaterial3d<FlameMaterial>>(flame).expect("a material").0.clone();
+        let material =
+            app.world().resource::<Assets<FlameMaterial>>().get(&handle).expect("it exists").clone();
+        (handle, material)
+    }
+
+    fn coloured(color: Option<Color>) -> FlameSite {
+        FlameSite { color, ..crate::FireKind::Torch.site() }
+    }
+
+    fn ramp_of(material: &FlameMaterial) -> [[f32; 3]; 4] {
+        let rgb = |v: Vec4| [v.x, v.y, v.z];
+        [
+            rgb(material.edge),
+            [material.base.red, material.base.green, material.base.blue],
+            rgb(material.core),
+            rgb(material.ember),
+        ]
+    }
+
+    /// A scene that sets no colour must draw what it always drew: the shipped ramp, on the scene's own two
+    /// materials, with no tinted material made for it.
+    #[test]
+    fn a_site_with_no_colour_of_its_own_is_drawn_with_the_scenes_shipped_ramp() {
+        use crate::model::fire_colour::{CORE_YELLOW, DEFAULT_MID, EDGE_RED, EMBER_RED};
+        let mut app = dressing_app();
+        let plain = app.world_mut().spawn(coloured(None)).id();
+        app.update();
+        let (handle, material) = drawn_with(&app, plain);
+        assert_eq!(ramp_of(&material), [EDGE_RED, DEFAULT_MID, CORE_YELLOW, EMBER_RED]);
+        assert_eq!(handle, app.world().resource::<FlameAssets>().material, "the scene's own material");
+        assert!(app.world().resource::<FlameAssets>().tinted.is_empty(), "nothing was tinted");
+    }
+
+    /// A fire of its own colour is drawn on a material of it: the colour the site asked for is the middle of the
+    /// ramp, the rest of the ramp is in its hue, and the scene's other flames are not touched.
+    #[test]
+    fn a_site_with_a_colour_is_drawn_in_that_hue_and_its_neighbours_stay_orange() {
+        use crate::model::fire_colour::{DEFAULT_MID, EDGE_RED, retint};
+        let mut app = dressing_app();
+        let blue = Color::from(LinearRgba::rgb(0.1, 0.3, 1.0));
+        let lit = app.world_mut().spawn(coloured(Some(blue))).id();
+        let orange = app.world_mut().spawn(coloured(None)).id();
+        app.update();
+        let (_, material) = drawn_with(&app, lit);
+        let [edge, mid, core, _] = ramp_of(&material);
+        assert_eq!(mid, [0.1, 0.3, 1.0]);
+        assert_eq!(edge, retint(EDGE_RED, mid));
+        assert!(edge[2] > edge[1] && edge[1] > edge[0], "a blue fire's rim is blue, not red: {edge:?}");
+        assert!(core[2] >= core[0] && core[2] >= core[1], "and so is its core: {core:?}");
+        let (_, neighbour) = drawn_with(&app, orange);
+        assert_eq!(ramp_of(&neighbour)[1], DEFAULT_MID, "a torch with no colour is still the scene's");
+    }
+
+    /// Two torches of one colour are one material (one batch), and a different colour is another; the depth fade
+    /// still picks the variant within a colour.
+    #[test]
+    fn flames_of_one_colour_share_a_material_and_a_depth_fade_picks_its_variant() {
+        let mut app = dressing_app();
+        let green = Color::from(LinearRgba::rgb(0.2, 1.0, 0.3));
+        let violet = Color::from(LinearRgba::rgb(0.6, 0.2, 1.0));
+        let a = app.world_mut().spawn(coloured(Some(green))).id();
+        let b = app.world_mut().spawn(coloured(Some(green))).id();
+        let c = app.world_mut().spawn(coloured(Some(violet))).id();
+        let d = app.world_mut().spawn(FlameSite { depth_fade: true, ..coloured(Some(green)) }).id();
+        app.update();
+        let handle = |site| drawn_with(&app, site).0;
+        assert_eq!(handle(a), handle(b), "one colour, one material");
+        assert_ne!(handle(a), handle(c), "two colours, two");
+        assert_ne!(handle(a), handle(d), "the depth-fade variant of a colour is its own");
+        assert_eq!(drawn_with(&app, d).1.params.z, 1.0);
+        assert_eq!(drawn_with(&app, a).1.params.z, 0.0);
+    }
+
+    /// A host changing a site's colour at any time (a slider, a spell, a palette) moves the flame to the new colour's
+    /// material; clearing it returns the flame to the scene's.
+    #[test]
+    fn changing_a_sites_colour_moves_its_flame_and_clearing_it_returns_it_to_the_scene() {
+        let mut app = dressing_app();
+        let site = app.world_mut().spawn(coloured(None)).id();
+        app.update();
+        let scene = drawn_with(&app, site).0;
+        app.world_mut().get_mut::<FlameSite>(site).expect("the site").color =
+            Some(Color::from(LinearRgba::rgb(0.2, 1.0, 0.3)));
+        app.update();
+        let (green, material) = drawn_with(&app, site);
+        assert_ne!(green, scene);
+        assert_eq!(material.base.green, 1.0);
+        app.world_mut().get_mut::<FlameSite>(site).expect("the site").color = None;
+        app.update();
+        assert_eq!(drawn_with(&app, site).0, scene);
+    }
+
+    /// A `FlameLook` change recolours the scene's flames and leaves a fire that chose its colour alone; the strength
+    /// and the height scale reach both.
+    #[test]
+    fn a_look_change_recolours_the_scene_but_not_a_fire_that_chose_its_colour() {
+        let mut app = dressing_app();
+        let violet = Color::from(LinearRgba::rgb(0.6, 0.2, 1.0));
+        let chosen = app.world_mut().spawn(coloured(Some(violet))).id();
+        let scene = app.world_mut().spawn(coloured(None)).id();
+        app.update();
+        {
+            let mut look = app.world_mut().resource_mut::<FlameLook>();
+            look.color = LinearRgba::rgb(0.2, 1.0, 0.3);
+            look.strength = 0.5;
+        }
+        app.update();
+        let (_, scene_material) = drawn_with(&app, scene);
+        assert_eq!(ramp_of(&scene_material)[1], [0.2, 1.0, 0.3], "the scene's flames follow the look");
+        let (_, chosen_material) = drawn_with(&app, chosen);
+        assert_eq!(ramp_of(&chosen_material)[1], [0.6, 0.2, 1.0], "a fire's own colour does not");
+        assert_eq!(chosen_material.params.w, 0.5, "but its strength is the scene's");
+        assert_eq!(chosen_material.base.alpha, 0.5);
+    }
+
+    /// Every distinct colour is a material, so a fire whose colour a host changes every frame must not make the number
+    /// of materials grow without bound: a material is released with the last flame that used it.
+    #[test]
+    fn a_colour_changed_every_frame_holds_a_bounded_number_of_materials() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_asset::<Mesh>()
+            .init_asset::<FlameMaterial>()
+            .init_resource::<FlameLook>()
+            .init_resource::<FlameAssets>()
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_secs_f64(1.0 / 60.0),
+            ));
+        app.add_systems(Startup, build_flame_assets)
+            .add_systems(Update, (dress_flames, update_flames).chain())
+            .add_systems(PostUpdate, Assets::<FlameMaterial>::track_assets.run_if(|| true));
+        app.update();
+        let site = app.world_mut().spawn(coloured(None)).id();
+        app.update();
+        let mut most = 0;
+        for frame in 0..300 {
+            let hue = frame as f32 / 300.0;
+            app.world_mut().get_mut::<FlameSite>(site).expect("the site").color = Some(Color::from(
+                LinearRgba::rgb(0.3 + 0.7 * hue, 1.0 - 0.8 * hue, 0.2 + 0.1 * (frame % 7) as f32),
+            ));
+            app.update();
+            most = most.max(app.world().resource::<Assets<FlameMaterial>>().len());
+        }
+        // The scene's two, the colour in use, and the one or two the asset system has not yet freed.
+        assert!(most <= 6, "300 colours made {most} live materials at once");
+    }
+
+    #[test]
+    fn a_colour_that_is_not_a_colour_is_reported_and_the_default_is_not() {
+        assert!(crate::FireKind::Torch.site().problems().is_empty());
+        let bad = FlameSite {
+            color: Some(Color::from(LinearRgba::rgb(f32::NAN, 0.5, -1.0))),
+            ..crate::FireKind::Torch.site()
+        };
+        let fields: Vec<_> = bad.problems().iter().map(|p| p.field).collect();
+        assert_eq!(fields, ["color.red", "color.blue"]);
     }
 }
 
@@ -1317,6 +1776,7 @@ mod kindle_tests {
         // `/home/ladvien/l18/kindle2_after/` the frames.
         let mut app = app();
         let site = FlameSite {
+            color: None,
             height: 0.9,
             phase: 0.0,
             kindle: KINDLE_SECONDS,
@@ -1352,6 +1812,7 @@ mod kindle_tests {
         let mut app = app();
         app.world_mut().spawn((
             FlameSite {
+                color: None,
                 height: 0.9,
                 phase: 0.0,
                 kindle: 0.0,
@@ -1411,6 +1872,7 @@ mod catch_colour_tests {
         let mut app = app();
         app.world_mut().spawn((
             FlameSite {
+                color: None,
                 height: 0.9,
                 phase: 0.0,
                 kindle: KINDLE_SECONDS,
@@ -1445,6 +1907,7 @@ mod catch_colour_tests {
         let mut app = app();
         app.world_mut().spawn((
             FlameSite {
+                color: None,
                 height: 0.9,
                 phase: 0.0,
                 kindle: KINDLE_SECONDS,
@@ -1457,6 +1920,7 @@ mod catch_colour_tests {
         ));
         app.world_mut().spawn((
             FlameSite {
+                color: None,
                 height: 0.9,
                 phase: 1.3,
                 kindle: 0.0,
@@ -1483,6 +1947,7 @@ mod catch_colour_tests {
 
     fn site_with(diameter: Option<f32>) -> FlameSite {
         FlameSite {
+            color: None,
             height: 0.9,
             phase: 0.0,
             kindle: 0.0,
@@ -1537,6 +2002,90 @@ mod catch_colour_tests {
         world.get::<FlameSite>(site).and_then(|s| s.diameter).unwrap_or(f32::NAN)
     }
 
+    /// Gives the one site its own ground velocity, as the tracker would after it had been walked.
+    fn move_site(app: &mut App, velocity: Vec2) {
+        let mut sites = app.world_mut().query_filtered::<&mut crate::FlameVelocity, With<FlameSite>>();
+        for mut v in sites.iter_mut(app.world_mut()) {
+            v.ground = velocity;
+        }
+    }
+
+    #[test]
+    fn a_fire_carried_through_still_air_leans_behind_its_bearer_by_the_tilt_of_its_pace() {
+        let mut app = app();
+        app.world_mut().spawn((site_with(Some(0.1)), Transform::default()));
+        assert_eq!(flame_scale(&mut app), Vec3::ONE, "standing still: upright");
+
+        move_site(&mut app, Vec2::new(1.4, 0.0));
+        let scale = flame_scale(&mut app);
+        let want = crate::model::flame_tilt(1.4, 0.1).sin();
+        assert!(
+            (scale.y - (1.0 - want)).abs() < 1e-6,
+            "walking along +X, the flame streams along -X: {scale:?}"
+        );
+        assert_eq!(scale.z, 1.0, "nothing across it: {scale:?}");
+        assert!(want > 0.6, "a walking pace lays a torch's flame well over: {want}");
+
+        move_site(&mut app, Vec2::new(0.0, 3.0));
+        let scale = flame_scale(&mut app);
+        assert!((scale.z - (1.0 - crate::model::flame_tilt(3.0, 0.1).sin())).abs() < 1e-6, "{scale:?}");
+        assert_eq!(scale.y, 1.0, "{scale:?}");
+
+        move_site(&mut app, Vec2::ZERO);
+        assert_eq!(flame_scale(&mut app), Vec3::ONE, "stopped: upright again");
+    }
+
+    #[test]
+    fn a_fire_feels_the_wind_less_its_own_velocity() {
+        let mut app = app();
+        app.world_mut().spawn((site_with(Some(0.1)), Transform::default()));
+        app.insert_resource(FlameWind { velocity: Vec2::new(2.0, 0.0) });
+        let lean = |scale: Vec3| scale.y - 1.0;
+
+        move_site(&mut app, Vec2::new(2.0, 0.0));
+        assert_eq!(
+            flame_scale(&mut app),
+            Vec3::ONE,
+            "moving with the wind at its speed: no air passes the flame"
+        );
+
+        move_site(&mut app, Vec2::new(-1.5, 0.0));
+        let into = lean(flame_scale(&mut app));
+        assert!(
+            (into - crate::model::flame_tilt(3.5, 0.1).sin()).abs() < 1e-6,
+            "into the wind the two add: {into}"
+        );
+
+        move_site(&mut app, Vec2::new(1.0, 0.0));
+        let with = lean(flame_scale(&mut app));
+        assert!(
+            (with - crate::model::flame_tilt(1.0, 0.1).sin()).abs() < 1e-6,
+            "with it they subtract: {with}"
+        );
+        assert!(with < into);
+    }
+
+    #[test]
+    fn a_motion_gain_of_zero_is_the_crate_as_it_was_and_a_half_is_half_the_pace() {
+        let mut app = app();
+        app.world_mut().spawn((site_with(Some(0.1)), Transform::default()));
+        move_site(&mut app, Vec2::new(2.0, 0.0));
+        app.insert_resource(crate::FlameMotion { gain: 0.0, ..default() });
+        assert_eq!(flame_scale(&mut app), Vec3::ONE, "gain 0: a moving flame stands as it always did");
+        app.insert_resource(crate::FlameMotion { gain: 0.5, ..default() });
+        let scale = flame_scale(&mut app);
+        assert!((scale.y - (1.0 - crate::model::flame_tilt(1.0, 0.1).sin())).abs() < 1e-6, "{scale:?}");
+    }
+
+    #[test]
+    fn a_fire_moved_faster_than_any_gale_is_laid_over_no_further_than_the_tilt_limit() {
+        let mut app = app();
+        app.world_mut().spawn((site_with(Some(0.8)), Transform::default()));
+        move_site(&mut app, Vec2::new(300.0, 0.0));
+        let scale = flame_scale(&mut app);
+        assert!(scale.y.is_finite() && (1.0 - scale.y) <= FLAME_TILT_LIMIT.sin() + 1e-6, "{scale:?}");
+    }
+
     #[test]
     fn a_wind_that_is_not_a_number_or_infinite_leaves_the_flame_upright() {
         let mut app = app();
@@ -1585,5 +2134,283 @@ mod catch_colour_tests {
         let fields: Vec<_> = bad.problems().iter().map(|p| p.field).collect();
         assert_eq!(fields, ["mean.x", "intensity"]);
         assert!(FlameGust::default().problems().is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+pub(crate) mod culling_tests {
+    use super::*;
+    use crate::model::{FLAME_REACH, FLICKER_DEPTH};
+    use crate::{FireKind, KINDLE_SECONDS};
+    use bevy::camera::primitives::{Frustum, Sphere};
+    use bevy::camera::{PerspectiveProjection, Projection};
+    use bevy::math::Affine3A;
+    use bevy::time::TimeUpdateStrategy;
+    use core::f32::consts::{FRAC_PI_2, TAU};
+
+    /// A seeded stream, so the sweep is the same on every machine.
+    struct Draw(u64);
+
+    impl Draw {
+        fn unit(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32
+        }
+
+        fn range(&mut self, low: f32, high: f32) -> f32 {
+            low + (high - low) * self.unit()
+        }
+    }
+
+    fn smoothstep(low: f32, high: f32, x: f32) -> f32 {
+        let t = ((x - low) / (high - low)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// Points on the flame's quad, a 5 x 5 grid of its corners and interior, where `src/flame.wesl`'s vertex
+    /// stage puts them: the same constants, the same two branches (the upright quad, and the quad that turns to
+    /// face a camera looking down on it), the same lean, for a camera at `eye` whose right axis is `camera_right`.
+    /// `origin` is the flame's foot, `size` the height it is drawn at, `wind` the instance scale's `y` and `z` less
+    /// one.
+    fn drawn_points(origin: Vec3, size: f32, wind: Vec2, eye: Vec3, camera_right: Vec3) -> Vec<Vec3> {
+        const ASPECT: f32 = 0.6;
+        const SOURCE_HEIGHT: f32 = 0.35;
+        const OVERHEAD_START: f32 = 0.873;
+        const OVERHEAD_FULL: f32 = 1.326;
+        const OVERHEAD_HEIGHT: f32 = 1.0;
+        let right = Vec3::new(camera_right.x, 0.0, camera_right.z).normalize();
+        let centre = origin + Vec3::Y * (size * SOURCE_HEIGHT);
+        let to_eye = eye - centre;
+        let sin_e = (to_eye.y / to_eye.length().max(1e-4)).clamp(0.0, 1.0);
+        let topdown = smoothstep(OVERHEAD_START, OVERHEAD_FULL, sin_e.asin());
+        let wind = wind * (1.0 - topdown);
+        let lean = wind.dot(Vec2::new(right.x, right.z));
+        let width = ASPECT + lean.abs();
+        let mut points = Vec::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                let (x, y) = (i as f32 / 4.0 - 0.5, j as f32 / 4.0 - 0.5);
+                let across = x * width + 0.5 * lean;
+                let mut at = origin + right * (across * size) + Vec3::Y * (y * size + size * 0.5);
+                if sin_e > OVERHEAD_START.sin() {
+                    let screen_up = to_eye.normalize().cross(right).normalize();
+                    at = centre + right * (across * size) + screen_up * (y * size * OVERHEAD_HEIGHT);
+                }
+                points.push(at);
+            }
+        }
+        points
+    }
+
+    /// The whole chain, as a camera sees it, for the quad a fire's vertex stage draws: the quad's points (`drawn_points`, given
+    /// the fire's foot, the height it is drawn at, its lean, the camera's eye and its right axis), the box and the scale this
+    /// crate gives it (`extents`, cut from a ball of `reach` drawn heights about the foot), and Bevy's own frustum test (the
+    /// sphere test and then the oriented box, as `check_visibility` runs them). A quad culled while any of its drawn points is
+    /// inside the frame is one that pops out at the edge of the screen.
+    pub(crate) fn assert_a_quad_on_screen_is_never_culled(
+        extents: fn(f32, f32, [f32; 2]) -> [f32; 3],
+        reach: fn([f32; 2]) -> f32,
+        drawn_points: fn(Vec3, f32, Vec2, Vec3, Vec3) -> Vec<Vec3>,
+    ) {
+        let mut draw = Draw(0x9e37_79b9_7f4a_7c15);
+        let projection = Projection::Perspective(PerspectiveProjection {
+            fov: 1.0,
+            aspect_ratio: 16.0 / 9.0,
+            near: 0.1,
+            far: 1000.0,
+            ..default()
+        });
+        let clip_from_view = projection.get_clip_from_view();
+        let (mut on_screen, mut edge) = (0, 0);
+        for round in 0..40_000 {
+            let origin = Vec3::new(draw.range(-3.0, 3.0), draw.range(0.0, 2.0), draw.range(-3.0, 3.0));
+            let height = draw.range(0.04, 3.0);
+            let took = if draw.unit() < 0.4 { 1.0 } else { draw.range(0.001, 1.0) };
+            let tilt = if draw.unit() < 0.25 { 0.0 } else { draw.range(0.0, 0.995) };
+            let heading = draw.range(0.0, TAU);
+            let lean = Vec2::new(heading.cos(), heading.sin()) * tilt;
+            // A camera at any distance and elevation, aimed so the flame lands anywhere from the middle of the
+            // frame to well outside it.
+            let around = draw.range(0.0, TAU);
+            let elevation = draw.range(-0.3, FRAC_PI_2);
+            let distance = draw.range(0.3, 14.0);
+            let eye = origin
+                + Vec3::new(around.cos() * elevation.cos(), elevation.sin(), around.sin() * elevation.cos())
+                    * distance;
+            let aim = origin
+                + Vec3::Y * (height * 0.4)
+                + Vec3::new(draw.range(-1.0, 1.0), draw.range(-1.0, 1.0), draw.range(-1.0, 1.0))
+                    * distance
+                    * 0.7;
+            let camera = GlobalTransform::from(Transform::from_translation(eye).looking_at(aim, Vec3::Y));
+            let frustum: Frustum = projection.compute_frustum(&camera);
+
+            // The parent may be turned any way: the scale is read as lengths, so a rotation must not matter.
+            let parent = if round % 2 == 0 {
+                Quat::IDENTITY
+            } else {
+                Quat::from_euler(
+                    EulerRot::YXZ,
+                    draw.range(0.0, TAU),
+                    draw.range(-1.5, 1.5),
+                    draw.range(0.0, TAU),
+                )
+            };
+            let world_from_local = Affine3A::from_scale_rotation_translation(
+                Vec3::new(took, 1.0 + lean.x, 1.0 + lean.y),
+                parent,
+                origin,
+            );
+            let global = GlobalTransform::from(world_from_local);
+            let [hx, hy, hz] = extents(height, took, lean.to_array());
+            let bound = Aabb { center: Vec3A::ZERO, half_extents: Vec3A::new(hx, hy, hz) };
+
+            let size = height * took.powf(2.0 / 3.0);
+            let world_from_view = camera.affine();
+            let view_from_world = world_from_view.inverse();
+            let points = drawn_points(origin, size, lean, eye, camera.right().as_vec3());
+            // The constant the box is built from: no point the vertex stage draws is further from the foot than
+            // `reach` of its drawn heights, from any side, at any lean.
+            let ball = (reach(lean.to_array()) * size) * (1.0 + 1e-4);
+            let worst = points.iter().map(|p| p.distance(origin)).fold(0.0, f32::max);
+            assert!(
+                worst <= ball,
+                "round {round}: a point {worst} from the foot of a quad of drawn height {size}, lean {lean}, ball {ball}"
+            );
+            let all = points.len();
+            let seen = points
+                .into_iter()
+                .filter(|p| {
+                    let clip = clip_from_view * view_from_world.transform_point3(*p).extend(1.0);
+                    clip.w > 0.0
+                        && clip.x.abs() <= clip.w
+                        && clip.y.abs() <= clip.w
+                        && clip.z > 0.0
+                        && clip.z <= clip.w
+                })
+                .count();
+            if seen == 0 {
+                continue;
+            }
+            on_screen += 1;
+            if seen < all {
+                edge += 1;
+            }
+            let sphere = Sphere {
+                center: world_from_local.transform_point3a(bound.center),
+                radius: global.radius_vec3a(bound.half_extents),
+            };
+            assert!(
+                frustum.intersects_sphere(&sphere, false)
+                    && frustum.intersects_obb(&bound, &world_from_local, true, false),
+                "round {round}: {seen} of {all} points of a quad of a {height} m fire (catch {took}, lean {lean}) are on screen, yet it is culled"
+            );
+        }
+        // The sweep must have exercised what it claims: many frames with the quad on screen, and many of them
+        // at the frame's edge, where a box that is too small is the one that fails.
+        assert!(on_screen > 8_000, "only {on_screen} samples had the quad on screen");
+        assert!(edge > 1_500, "only {edge} samples had it half out of the frame");
+    }
+
+    #[test]
+    fn a_flame_any_part_of_which_is_on_screen_is_never_culled() {
+        // The quad the vertex stage draws (`drawn_points`), the box and the scale this crate gives the flame, and Bevy's
+        // own frustum test: a flame culled while any of its drawn points is inside the frame pops out at the screen's edge.
+        assert_a_quad_on_screen_is_never_culled(flame_cull_extents, |_| FLAME_REACH, drawn_points);
+    }
+
+    fn app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<FlameMaterial>::default())
+            .init_resource::<FlameLook>()
+            .init_resource::<FlameAssets>()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(std::time::Duration::from_secs_f64(
+                1.0 / 60.0,
+            )));
+        app.add_systems(Startup, build_flame_assets)
+            .add_systems(Update, (dress_flames, update_flames).chain());
+        app.update();
+        app
+    }
+
+    /// The flame's box as the frustum test sees it, on its three axes: the half-extent in the entity's own
+    /// axes times the scale the shader reads.
+    fn world_half_extents(app: &mut App) -> (Vec3, Vec3) {
+        let (transform, bound) = app
+            .world_mut()
+            .query_filtered::<(&Transform, &Aabb), With<Flame>>()
+            .single(app.world())
+            .map(|(t, b)| (*t, *b))
+            .unwrap();
+        (transform.scale, Vec3::from(bound.half_extents) * transform.scale)
+    }
+
+    #[test]
+    fn a_flames_box_keeps_its_size_through_the_catch_and_the_lean() {
+        // The scale is the shader's data (its catch and its lean), so it changes every frame the fire catches or
+        // the wind gusts. The frustum test multiplies the box by it; the box must have been divided by it first,
+        // so what the test sees is the cube round the drawn flame at every moment, and not a slab.
+        let mut app = app();
+        app.insert_resource(FlameWind { velocity: Vec2::new(3.0, -1.5) });
+        let height = 0.9;
+        app.world_mut().spawn((
+            FlameSite {
+                color: None,
+                height,
+                phase: 0.0,
+                kindle: KINDLE_SECONDS,
+                diameter: None,
+                depth: FLICKER_DEPTH,
+                depth_fade: false,
+                fire: None,
+            },
+            Transform::default(),
+        ));
+        let mut seen_small = false;
+        for frame in 0..(KINDLE_SECONDS * 60.0) as usize + 6 {
+            app.update();
+            let (scale, world) = world_half_extents(&mut app);
+            // The shader clamps the catch to 1 (a light's flare overshoots it), so the drawn size does too; the
+            // box's `x` is divided by the clamped catch and multiplied by the real scale, and may exceed the cube
+            // by exactly the overshoot, never fall short of it.
+            let size = height * scale.x.min(1.0).powf(2.0 / 3.0);
+            let want = Vec3::splat(FLAME_REACH * size);
+            let slack = 1e-4 * (1.0 + want.max_element());
+            assert!(
+                (world.y - want.y).abs() < slack
+                    && (world.z - want.z).abs() < slack
+                    && world.x >= want.x - slack
+                    && world.x <= want.x * scale.x.max(1.0) + slack,
+                "frame {frame}: scale {scale}, the box measures {world} and the drawn flame wants {want}"
+            );
+            seen_small |= scale.x < 0.3 && (scale.y - 1.0).abs() > 0.1;
+        }
+        assert!(
+            seen_small,
+            "the run never had a small, leaning flame, so it did not test the catch and the lean together"
+        );
+    }
+
+    #[test]
+    fn a_flame_carries_a_box_of_its_own_and_is_not_left_to_the_units_quad() {
+        let mut app = app();
+        app.world_mut().spawn((FireKind::Torch.site(), Transform::default()));
+        app.update();
+        let flame = app.world_mut().query_filtered::<Entity, With<Flame>>().single(app.world()).unwrap();
+        let entity = app.world().entity(flame);
+        assert!(entity.contains::<Aabb>(), "a flame has a culling box");
+        assert!(
+            entity.contains::<bevy::camera::visibility::NoAutoAabb>(),
+            "which Bevy is told not to recompute"
+        );
+        assert!(
+            !entity.contains::<bevy::camera::visibility::NoFrustumCulling>(),
+            "and which the frustum test uses: an off-screen flame is not drawn"
+        );
     }
 }

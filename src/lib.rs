@@ -13,6 +13,9 @@
 //!   recolours them, its flames are not drawn on them).
 //! - [`FlameMaterial`], [`FlameSite`] — [`FlamePlugin`] draws a billboarded, additive shader flame
 //!   standing on every [`FlameSite`], out of one material and one draw per flame: `src/flame.wesl`.
+//! - [`Fire`] — [`FirePlugin`] writes a whole fire from one component: `Fire::lit(FireKind::Campfire, 250.0, 0.4)`
+//!   is the kind's flame, the light the pool hands it, and its sparks, smoke, tongues and bed of coals, each fire on a
+//!   clock of its own. It is the way in; the three above are the parts it writes, for a host that wants every number.
 //!
 //! Under those three is the cinematographer's half, [`model::cinematography`]: [`key_to_fill`] and
 //! [`stops`] for a scene's key against its fill, [`fill_for`] for the sky that makes a night,
@@ -20,8 +23,9 @@
 //! light's colour from the temperature it burns at. They touch no light: the same numbers a director
 //! of photography sets before a lamp is hung, for a host to size and colour its practicals with.
 //!
-//! Every plugin is independent; adding some and not others is supported, and
-//! [`LightPoolPlugin`] warns (it does not panic) when [`FlickerPlugin`] is missing.
+//! The three plugins are independent of each other; adding some and not others is supported, and
+//! [`LightPoolPlugin`] warns (it does not panic) when [`FlickerPlugin`] is missing. [`FirePlugin`] writes what the
+//! other three run, so it warns when any of them is missing.
 //!
 //! ```no_run
 //! # use bevy::prelude::*;
@@ -39,7 +43,7 @@
 //!             Kindle::default(),
 //!             // `diameter` matches the `Flicker`'s, so the drawn flame breathes with the light.
 //!             FlameSite { height: 0.9, phase: 0.0, kindle: 0.0, diameter: Some(0.34),
-//!                 depth: FLICKER_DEPTH, depth_fade: false, fire: None }));
+//!                 depth: FLICKER_DEPTH, depth_fade: false, fire: None, color: None }));
 //!         commands.spawn((MyFocus, Transform::default()));
 //!         // A carried fire: one entity holds the `FlameSite` and the `PoolCandidate`, so the light it
 //!         // is handed sits in the flame the host can see. `offset` is the flame's own centre, measured
@@ -51,7 +55,7 @@
 //!                 ..default()
 //!             },
 //!             FlameSite { height, phase: 9.0, kindle: 0.0, diameter: None, depth: FLICKER_DEPTH,
-//!                 depth_fade: false, fire: None },
+//!                 depth_fade: false, fire: None, color: None },
 //!             Transform::from_xyz(4.0, 0.0, 2.0)));
 //!     });
 //! # }
@@ -79,27 +83,49 @@
 
 pub mod model;
 
+mod bed;
 mod embers;
+mod fire;
 mod flame;
 mod flicker;
 mod kind;
+mod motion;
 mod pool;
 mod report;
+mod smoke;
+mod tongues;
 
+pub use bed::FuelBed;
 pub use embers::{FlameEmbers, MAX_EMBER_RATE};
+pub use fire::{FIRE_EDGE_LUX, Fire, FirePlugin};
 pub use flame::{Flame, FlameGust, FlameLook, FlameMaterial, FlamePlugin, FlameSite, FlameWind};
 pub use flicker::{Flicker, FlickerPlugin, Kindle, Kindled, Snuff, Snuffed};
 pub use kind::{FireKind, UnknownFireKind};
 pub use model::{
-    CALM_FLICKER_DEPTH, DEFAULT_FIRE_DIAMETER, EMBER_AT, FADE_SECONDS, FLAME_TILT_LIMIT, FLICKER_DEPTH,
-    HIGH_KEY, HYSTERESIS, KINDLE_SECONDS, LOW_KEY, MAX_FLICKER_DEPTH, MOON_KEY, Problem, ProblemKind,
-    RANGE_MARGIN, SNUFF_SECONDS, WHIPPING_FLICKER_DEPTH, blackbody_colour, blackbody_luminance, char_field,
-    char_radiance, coal_radiance, fade_factor, fill_for, fire_lumens, fire_lux, fire_reach,
-    flame_light_offset, flame_tilt, flicker_depth, flicker_factor, flicker_mean, flicker_swing, ground_lux,
-    ground_ramp, ground_reach, hand_off, key_to_fill, kindle_gain, lean_light_shift, pack_flame_tag,
-    preferred, raised_light, shadow_set, snuff_gain, stops, unpack_flame_tag, white_balanced,
+    CALM_FLICKER_DEPTH, DEFAULT_BED_COOLING, DEFAULT_FIRE_DIAMETER, EMBER_AT, FADE_SECONDS, FIRE_KELVIN,
+    FLAME_REACH, FLAME_TILT_LIMIT, FLICKER_DEPTH, HIGH_KEY, HYSTERESIS, KINDLE_SECONDS, LOW_KEY,
+    MAX_FLICKER_DEPTH, MAX_TONGUES, MAX_TRACKED_SPEED, MERGE_RATIO, MIN_TRACKED_SPEED, MOON_KEY,
+    MOTION_RESPONSE, Problem, ProblemKind, RANGE_MARGIN, SMOKE_TAIL_SECONDS, SNUFF_SECONDS, Tongue,
+    WHIPPING_FLICKER_DEPTH, bed_drawn_heat, bed_heat_step, bed_radiance, bed_visible_heat, blackbody_colour,
+    blackbody_luminance, blackbody_radiance, char_field, char_radiance, char_tile, coal_radiance,
+    ember_cull_extents, ember_reach, fade_factor, fill_for, fire_lumens, fire_lux, fire_phase, fire_reach,
+    flame_cull_extents, flame_light_offset, flame_mid, flame_tilt, flame_tongue, flicker_depth,
+    flicker_factor, flicker_mean, flicker_swing, focus_quota, ground_lux, ground_ramp, ground_reach,
+    hand_off, key_to_fill, kindle_gain, lean_light_shift, pack_flame_tag, preferred, quota_cutoff,
+    raised_light, relative_air, retint, shadow_set, shared_value, smooth_velocity, snuff_gain, stops,
+    unpack_flame_tag, white_balanced,
 };
-pub use pool::{LightPool, LightPoolPlugin, PoolBudget, PoolCandidate, PoolLight, Rank};
+pub use motion::{FlameMotion, FlameVelocity};
+pub use pool::{FocusRule, LightPool, LightPoolPlugin, PoolBudget, PoolCandidate, PoolLight, Rank};
+pub use smoke::{FlameSmoke, MAX_SMOKE_DENSITY};
+pub use tongues::{FlameTongue, FlameTongues};
+
+// The README's Rust examples are doctests, so a snippet the README shows cannot rot: `cargo test --doc`
+// compiles it. `tests/readme.rs` is the stronger check (it builds the quick start as an example, so a
+// `no_run` block's body is compiled *and* its warnings are caught); this one makes `--doc` alone enough.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 use bevy::prelude::*;
 
