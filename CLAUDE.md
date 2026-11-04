@@ -64,9 +64,9 @@ cargo build --lib --target wasm32-unknown-unknown
 cargo run --release --manifest-path tools/wesl-check/Cargo.toml -- src
 ```
 
-Use `CARGO_TARGET_DIR=$HOME/bevy_lights/target` on mac_air: the shared
-`~/.cargo-target-shared/global` is 85 GB and the boot volume has crossed 98 % full, at which point
-builds fail with `No space left on device` in the middle of a link and read as a code error.
+Use CARGO_TARGET_DIR=$HOME/bevy_lights/target on mac_air; a shared target dir can fill the boot volume,
+and builds then fail with 'No space left on device' in the middle of a link, which reads as a code
+error.
 
 `cargo build` (bare) comes before `cargo test` deliberately: `cargo test` compiles the full `bevy`
 dev-dependency, and Cargo unifies features across a build, so under `cargo test` the crate silently
