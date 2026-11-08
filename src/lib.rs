@@ -23,6 +23,9 @@
 //! light's colour from the temperature it burns at. They touch no light: the same numbers a director
 //! of photography sets before a lamp is hung, for a host to size and colour its practicals with.
 //!
+//! [`LightsPlugins`] adds all four at once, measuring the pool from [`PoolFocus`]; a host with a focus marker of its own adds the
+//! plugins one by one.
+//!
 //! The three plugins are independent of each other; adding some and not others is supported, and
 //! [`LightPoolPlugin`] warns (it does not panic) when [`FlickerPlugin`] is missing. [`FirePlugin`] writes what the
 //! other three run, so it warns when any of them is missing.
@@ -116,7 +119,9 @@ pub use model::{
     unpack_flame_tag, white_balanced,
 };
 pub use motion::{FlameMotion, FlameVelocity};
-pub use pool::{FocusRule, LightPool, LightPoolPlugin, PoolBudget, PoolCandidate, PoolLight, Rank};
+pub use pool::{
+    FocusRule, LightPool, LightPoolPlugin, PoolBudget, PoolCandidate, PoolFocus, PoolLight, Rank,
+};
 pub use smoke::{FlameSmoke, MAX_SMOKE_DENSITY};
 pub use tongues::{FlameTongue, FlameTongues};
 
@@ -129,23 +134,50 @@ struct ReadmeDoctests;
 
 use bevy::prelude::*;
 
-/// The order the crate's systems run in `Update`.
+/// Every system the crate adds, in the order they run in `Update`.
 ///
-/// [`LightsSystems::Pool`] hands the real lights out before [`LightsSystems::Flicker`] modulates
-/// them, so a light handed to a new candidate flickers at its new base in the very same frame; and
-/// [`LightsSystems::Flame`] dresses sites after both, so a flame is drawn on the frame its site
-/// appears.
+/// [`LightsSystems::Fire`] and [`LightsSystems::Motion`] run first and unordered between themselves:
+/// a [`Fire`] is expanded into its parts, and each flame's ground velocity is read, before the pool
+/// looks at either. [`LightsSystems::Pool`] hands the real lights out before [`LightsSystems::Flicker`]
+/// modulates them, so a light handed to a new candidate flickers at its new base in the very same
+/// frame; and [`LightsSystems::Flame`] dresses sites after both, so a flame is drawn on the frame its
+/// site appears. [`LightsSystems::Report`] runs in `Last`. Systems that run in another schedule
+/// (`Startup`, `PostUpdate`, `Last`) are in the set of the work they belong to.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LightsSystems {
+    /// [`FirePlugin`]: writing a [`Fire`]'s parts.
+    Fire,
+    /// [`FlamePlugin`]: each flame site's smoothed ground velocity.
+    Motion,
     /// The light pool: spawning, resizing and assigning the real lights.
     Pool,
     /// `Flicker` and `Kindle`, on every point and spot light that carries them.
     Flicker,
     /// The shader flames: dressing new sites and ticking their shared clock.
     Flame,
+    /// The warnings about unusable settings, in `Last`.
+    Report,
 }
 
 /// Chains the crate's sets, and does it idempotently, so each plugin may call it.
 fn chain_sets(app: &mut App) {
-    app.configure_sets(Update, (LightsSystems::Pool, LightsSystems::Flicker, LightsSystems::Flame).chain());
+    app.configure_sets(Update, (LightsSystems::Pool, LightsSystems::Flicker, LightsSystems::Flame).chain())
+        .configure_sets(Update, (LightsSystems::Fire, LightsSystems::Motion).before(LightsSystems::Pool));
+}
+
+/// The whole crate as one group: [`LightPoolPlugin`] (with [`PoolFocus`] as its focus marker),
+/// [`FlickerPlugin`], [`FlamePlugin`] and [`FirePlugin`], in that order.
+///
+/// A host with its own focus marker adds the four plugins itself, with `LightPoolPlugin::<MyFocus>`.
+/// [`FlamePlugin`] adds materials, so the group needs a render app, as that plugin does.
+pub struct LightsPlugins;
+
+impl PluginGroup for LightsPlugins {
+    fn build(self) -> bevy::app::PluginGroupBuilder {
+        bevy::app::PluginGroupBuilder::start::<Self>()
+            .add(LightPoolPlugin::<PoolFocus>::default())
+            .add(FlickerPlugin)
+            .add(FlamePlugin)
+            .add(FirePlugin)
+    }
 }

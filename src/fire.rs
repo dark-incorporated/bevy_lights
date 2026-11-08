@@ -57,7 +57,9 @@ pub const FIRE_EDGE_LUX: f32 = 250.0;
 /// campfire.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(default))]
+#[require(Transform)]
 #[reflect(Component, Default)]
+#[cfg_attr(feature = "serde", reflect(Serialize, Deserialize))]
 pub struct Fire {
     /// What burns: the flame's height, the bed's diameter (which sizes the flicker), how far it dips, and which of the extras it has.
     pub kind: FireKind,
@@ -183,7 +185,7 @@ pub struct FirePlugin;
 impl Plugin for FirePlugin {
     fn build(&self, app: &mut App) {
         crate::chain_sets(app);
-        app.register_type::<Fire>().add_systems(Update, expand_fires.before(LightsSystems::Pool));
+        app.register_type::<Fire>().add_systems(Update, expand_fires.in_set(LightsSystems::Fire));
         crate::report::watch::<Fire>(app);
     }
 

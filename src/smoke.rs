@@ -194,7 +194,7 @@ pub(crate) fn build(app: &mut App) {
     app.add_plugins(bevy::pbr::MaterialPlugin::<SmokeMaterial>::default())
         .init_resource::<SmokeAssets>()
         .register_type::<FlameSmoke>()
-        .add_systems(Startup, build_smoke_assets);
+        .add_systems(Startup, build_smoke_assets.in_set(crate::LightsSystems::Flame));
 }
 
 /// The quad, the scene's two materials (depth fade off and on) and one more for each colour a site asks for, which every smoke quad

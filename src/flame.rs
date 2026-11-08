@@ -81,8 +81,8 @@ impl Plugin for FlamePlugin {
                     .chain()
                     .in_set(LightsSystems::Flame),
             )
-            .add_systems(Update, crate::motion::track_flame_velocity.before(LightsSystems::Pool))
-            .add_systems(Startup, build_flame_assets);
+            .add_systems(Update, crate::motion::track_flame_velocity.in_set(LightsSystems::Motion))
+            .add_systems(Startup, build_flame_assets.in_set(LightsSystems::Flame));
         crate::report::watch::<FlameSite>(app);
         crate::report::watch::<crate::FlameEmbers>(app);
         crate::report::watch::<crate::FlameSmoke>(app);

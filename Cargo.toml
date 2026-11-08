@@ -59,7 +59,7 @@ path = "examples/readme_quick_start.rs"
 required-features = ["readme-example"]
 
 [dev-dependencies]
-bevy = { version = "0.20.0" } # full umbrella, examples and tests only
+bevy = { version = "0.20.0", features = ["debug"] } # full umbrella, examples and tests only; `debug` gives systems their full names for tests/machine_plate.rs
 serde_json = "1" # https://github.com/serde-rs/json — the serde tests' wire format
 
 [lints.rust]

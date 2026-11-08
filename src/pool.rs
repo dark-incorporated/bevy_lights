@@ -61,6 +61,7 @@ impl<F: Component> Plugin for LightPoolPlugin<F> {
             .register_type::<LightPool>()
             .register_type::<PoolCandidate>()
             .register_type::<PoolLight>()
+            .register_type::<PoolFocus>()
             .init_resource::<PoolBudget>()
             .register_type::<PoolBudget>()
             // The messages are registered by `FlickerPlugin` too; `add_message` twice is harmless, and the
@@ -84,6 +85,15 @@ impl<F: Component> Plugin for LightPoolPlugin<F> {
         }
     }
 }
+
+/// The focus marker [`LightsPlugins`](crate::LightsPlugins) measures from: put it on the entity the pool serves (the camera, the player).
+///
+/// A host with a marker of its own adds [`LightPoolPlugin`] with that type instead, and never needs this one.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[reflect(Component, Default)]
+#[cfg_attr(feature = "serde", reflect(Serialize, Deserialize))]
+pub struct PoolFocus;
 
 /// The pool's budget and the light it spawns: how many real lights exist, how far a candidate may be
 /// from the focus to get one, how brightly the pool burns, and the light every slot starts from.

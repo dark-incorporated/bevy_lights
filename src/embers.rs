@@ -164,7 +164,7 @@ pub(crate) fn build(app: &mut App) {
     app.add_plugins(bevy::pbr::MaterialPlugin::<EmberMaterial>::default())
         .init_resource::<EmberAssets>()
         .register_type::<FlameEmbers>()
-        .add_systems(Startup, build_ember_assets);
+        .add_systems(Startup, build_ember_assets.in_set(crate::LightsSystems::Flame));
 }
 
 /// The quad, the scene's two materials (depth fade off and on) and one more for each colour a site asks for, which every ember

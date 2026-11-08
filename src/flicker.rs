@@ -4,6 +4,8 @@
 //! same way a brazier does: it is the same fire.
 
 use bevy::camera::visibility::VisibilitySystems;
+use bevy::ecs::lifecycle::HookContext;
+use bevy::ecs::world::DeferredWorld;
 use bevy::light::{PointLight, SpotLight};
 use bevy::prelude::*;
 use bevy::time::Time;
@@ -33,6 +35,7 @@ impl Plugin for FlickerPlugin {
             .add_systems(
                 PostUpdate,
                 write_lights_coming_into_view
+                    .in_set(LightsSystems::Flicker)
                     .after(VisibilitySystems::CheckVisibility)
                     .after(VisibilitySystems::MarkNewlyHiddenEntitiesInvisible),
             );
@@ -53,9 +56,15 @@ impl Plugin for FlickerPlugin {
 /// [`PointLight`] or a [`SpotLight`]. Two fires given different phases never fall into step, and the
 /// `diameter` here is the same number the flame drawn on the fire should be given, so the two breathe
 /// together.
+///
+/// **Inserted alone it works.** A `Flicker` on an entity with no [`PointLight`] and no [`SpotLight`]
+/// is given a default [`PointLight`] the moment it arrives, at `base` lumens, and the flicker then
+/// drives that. An entity that carries either light of its own is left as it is.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(default))]
-#[reflect(Component)]
+#[component(on_add = light_when_alone)]
+#[reflect(Component, Default)]
+#[cfg_attr(feature = "serde", reflect(Serialize, Deserialize))]
 pub struct Flicker {
     /// The light's mean intensity, in the same units as the light's own `intensity` (lumens).
     ///
@@ -83,6 +92,18 @@ pub struct Flicker {
     /// value on the [`FlameSite`](crate::FlameSite) drawn on the fire**, so the flame and the ground
     /// under it dip together.
     pub depth: f32,
+}
+
+/// `Flicker`'s `on_add` hook: a flicker with no light to drive is given a default [`PointLight`] at its `base`.
+///
+/// The check is on the entity after the whole bundle landed, so `(Flicker, SpotLight)` and `(Flicker, PointLight)` are untouched.
+fn light_when_alone(mut world: DeferredWorld, context: HookContext) {
+    let entity = world.entity(context.entity);
+    if entity.contains::<PointLight>() || entity.contains::<SpotLight>() {
+        return;
+    }
+    let intensity = entity.get::<Flicker>().map_or(0.0, |flicker| flicker.base);
+    world.commands().entity(context.entity).insert(PointLight { intensity, ..default() });
 }
 
 impl Default for Flicker {

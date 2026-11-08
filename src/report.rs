@@ -97,5 +97,5 @@ fn warn_on_change<R: Checked + Resource>(resource: Option<Res<R>>, mut warned: L
 
 /// Checks the resource `R` on every frame it changes.
 pub(crate) fn watch_resource<R: Checked + Resource>(app: &mut App) {
-    app.add_systems(Last, warn_on_change::<R>);
+    app.add_systems(Last, warn_on_change::<R>.in_set(crate::LightsSystems::Report));
 }
